@@ -46,6 +46,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var latestFans: [FanDTO] = []
     private var latestTemps: [TemperatureDTO] = []
 
+    /// CPU-family sensor groups that nest under a single "CPU" parent in
+    /// the menu. `.cpu` is the Intel-era / miscellaneous fallback; under
+    /// the parent it's relabelled "Other" to avoid a "CPU → CPU" row.
+    private static let cpuFamilyGroups: Set<SensorGroup> = [.pcore, .ecore, .soc, .cpu]
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
@@ -298,7 +303,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if latestTemps.isEmpty {
             menu.addItem(disabled("  No sensors found"))
         } else {
-            for (group, list) in groupedTemps(latestTemps) {
+            let grouped = groupedTemps(latestTemps)
+            let cpuFamily = grouped.filter { Self.cpuFamilyGroups.contains($0.0) }
+            let others = grouped.filter { !Self.cpuFamilyGroups.contains($0.0) }
+            if !cpuFamily.isEmpty {
+                menu.addItem(cpuFamilyMenuItem(children: cpuFamily))
+            }
+            for (group, list) in others {
                 menu.addItem(temperatureGroupItem(group: group, readings: list))
             }
         }
@@ -325,8 +336,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let pCores = temps.filter { $0.rawName.hasPrefix("pACC ") }
         if let hot = pCores.max(by: { $0.celsius < $1.celsius }) { return hot }
         // Fall back through any CPU-adjacent group before going to all temps.
-        let cpuGroups: Set<SensorGroup> = [.pcore, .ecore, .soc, .cpu]
-        let cpuish = temps.filter { cpuGroups.contains($0.group) }
+        let cpuish = temps.filter { Self.cpuFamilyGroups.contains($0.group) }
         return (cpuish.isEmpty ? temps : cpuish).max { $0.celsius < $1.celsius }
     }
 
@@ -383,16 +393,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return item
     }
 
-    private func temperatureGroupItem(group: SensorGroup, readings: [TemperatureDTO]) -> NSMenuItem {
+    private func temperatureGroupItem(group: SensorGroup,
+                                      readings: [TemperatureDTO],
+                                      displayName: String? = nil) -> NSMenuItem {
+        let name = displayName ?? group.rawValue
         let avg = readings.map { $0.celsius }.reduce(0, +) / Double(readings.count)
         let title = String(format: "%@ — %.1f°C avg (%d sensor%@)",
-                           group.rawValue, avg, readings.count,
+                           name, avg, readings.count,
                            readings.count == 1 ? "" : "s")
         let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
         let submenu = NSMenu()
         submenu.delegate = self
         for r in readings {
             submenu.addItem(disabled(String(format: "%@  %.1f°C", r.displayName, r.celsius)))
+        }
+        item.submenu = submenu
+        return item
+    }
+
+    /// Rolls up the CPU-family subgroups (P-Cores / E-Cores / SoC / Other)
+    /// under a single "CPU" parent with an aggregate average across all
+    /// contained sensors. Each child remains its own submenu.
+    private func cpuFamilyMenuItem(children: [(SensorGroup, [TemperatureDTO])]) -> NSMenuItem {
+        let all = children.flatMap { $0.1 }
+        let avg = all.map { $0.celsius }.reduce(0, +) / Double(all.count)
+        let title = String(format: "CPU — %.1f°C avg (%d sensor%@)",
+                           avg, all.count, all.count == 1 ? "" : "s")
+        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        let submenu = NSMenu()
+        submenu.delegate = self
+        for (group, list) in children {
+            let displayName: String? = (group == .cpu) ? "Other" : nil
+            submenu.addItem(temperatureGroupItem(group: group,
+                                                 readings: list,
+                                                 displayName: displayName))
         }
         item.submenu = submenu
         return item
