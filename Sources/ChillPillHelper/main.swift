@@ -37,8 +37,14 @@ func installSignalHandlers() {
     signal(SIGTERM, SIG_IGN)
     signal(SIGINT, SIG_IGN)
 
-    let handler: DispatchSourceProtocol.DispatchSourceHandler = {
-        Fans.restoreAllToAuto()
+    let handler: @Sendable () -> Void = {
+        // sync on SMC.queue so any in-flight XPC-driven SMC transaction
+        // finishes before we restore-to-auto and exit. This matters: the
+        // signal handler would otherwise race concurrent setFanTarget
+        // calls hitting the same `AppleSMC` userclient.
+        SMC.queue.sync {
+            Fans.restoreAllToAuto()
+        }
         exit(0)
     }
     let term = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
@@ -46,10 +52,10 @@ func installSignalHandlers() {
     term.resume()
     signalSources.append(term)
 
-    let int = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
-    int.setEventHandler(handler: handler)
-    int.resume()
-    signalSources.append(int)
+    let sigint = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+    sigint.setEventHandler(handler: handler)
+    sigint.resume()
+    signalSources.append(sigint)
 }
 
 // Retain the sources globally so they stay alive past main().

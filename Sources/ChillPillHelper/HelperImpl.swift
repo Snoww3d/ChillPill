@@ -5,17 +5,14 @@ import ChillPillShared
 /// input before touching SMC and returns a descriptive `NSError` on failure
 /// so the UI can show something better than a generic "it failed".
 ///
-/// All SMC access is serialized through `smcQueue`. NSXPCListener can dispatch
-/// concurrent incoming requests across its own queues, and the single
-/// `AppleSMC` userclient is not safe to hammer from multiple threads — one
-/// open call racing another would leak userclients or read half-open state.
-/// Holding method bodies on a single serial queue also means
-/// `Fans.setTarget`'s read-then-write sequences are atomic from any client's
-/// perspective.
+/// All SMC access is serialized through `SMC.queue` (shared across every
+/// caller — XPC methods here, and the signal handler in `main.swift`).
+/// NSXPCListener can dispatch concurrent incoming requests across its own
+/// threads, and the single `AppleSMC` userclient is not safe to hammer
+/// from multiple threads.
 final class HelperImpl: NSObject, ChillPillHelperProtocol {
 
     private let version: String
-    private let smcQueue = DispatchQueue(label: "dev.chillpill.helper.smc")
 
     init(version: String) {
         self.version = version
@@ -26,7 +23,7 @@ final class HelperImpl: NSObject, ChillPillHelperProtocol {
     }
 
     func fans(reply: @escaping (Data?, NSError?) -> Void) {
-        smcQueue.async {
+        SMC.queue.async {
             do {
                 let list = Fans.readAll()
                 let data = try JSONEncoder().encode(list)
@@ -39,7 +36,7 @@ final class HelperImpl: NSObject, ChillPillHelperProtocol {
     }
 
     func temperatures(reply: @escaping (Data?, NSError?) -> Void) {
-        smcQueue.async {
+        SMC.queue.async {
             do {
                 let list = Sensors.readThermal()
                 let data = try JSONEncoder().encode(list)
@@ -52,7 +49,7 @@ final class HelperImpl: NSObject, ChillPillHelperProtocol {
     }
 
     func setFanAuto(index: Int, reply: @escaping (NSError?) -> Void) {
-        smcQueue.async {
+        SMC.queue.async {
             guard (0..<Fans.count()).contains(index) else {
                 reply(chillPillHelperError(.invalidIndex, "fan index \(index) out of range"))
                 return
@@ -66,7 +63,7 @@ final class HelperImpl: NSObject, ChillPillHelperProtocol {
     }
 
     func setFanTarget(index: Int, rpm: Double, reply: @escaping (NSError?) -> Void) {
-        smcQueue.async {
+        SMC.queue.async {
             guard (0..<Fans.count()).contains(index) else {
                 reply(chillPillHelperError(.invalidIndex, "fan index \(index) out of range"))
                 return
@@ -85,14 +82,14 @@ final class HelperImpl: NSObject, ChillPillHelperProtocol {
     }
 
     func setAllFansAuto(reply: @escaping (NSError?) -> Void) {
-        smcQueue.async {
+        SMC.queue.async {
             Fans.restoreAllToAuto()
             reply(nil)
         }
     }
 
     func setAllFansTarget(pct: Double, reply: @escaping (NSError?) -> Void) {
-        smcQueue.async {
+        SMC.queue.async {
             guard pct.isFinite else {
                 reply(chillPillHelperError(.invalidRPM, "pct must be a finite number"))
                 return
@@ -107,7 +104,7 @@ final class HelperImpl: NSObject, ChillPillHelperProtocol {
     }
 
     func prepareForShutdown(reply: @escaping (NSError?) -> Void) {
-        smcQueue.async {
+        SMC.queue.async {
             Fans.restoreAllToAuto()
             reply(nil)
         }
