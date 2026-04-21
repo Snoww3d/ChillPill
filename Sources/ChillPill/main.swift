@@ -42,6 +42,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private var suppressTitleUpdateUntil: Date?
     private var fatalSignalFired = false
+    private var hasShownApprovalPromptThisLaunch = false
+    /// Flipped true once `maybeShowApprovalPromptOnce` has had its first
+    /// chance to run (whether or not it actually showed the alert). Gates
+    /// the `⚠︎` status-bar badge so it doesn't flicker on between app
+    /// launch and the deferred main-queue block that evaluates state.
+    private var launchApprovalCheckComplete = false
 
     private var latestFans: [FanDTO] = []
     private var latestTemps: [TemperatureDTO] = []
@@ -69,6 +75,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         RunLoop.main.add(t, forMode: .common)
         timer = t
+
+        // Deferred so launch finishes (status bar drawn, timer scheduled)
+        // before the modal alert blocks the main queue. One-shot per launch.
+        DispatchQueue.main.async { [weak self] in
+            self?.maybeShowApprovalPromptOnce()
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -219,8 +231,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func openLoginItemsSettings(_ sender: NSMenuItem) {
+        openLoginItemsSettings()
+    }
+
+    private func openLoginItemsSettings() {
         if let url = URL(string: "x-apple.systempreferences:com.apple.LoginItems-Settings.extension") {
             NSWorkspace.shared.open(url)
+        }
+    }
+
+    /// Shows a modal alert when the helper is stuck in `.requiresApproval` on
+    /// launch. Fires at most once per launch, honors the explicit-uninstall
+    /// flag, and is a no-op outside the .app bundle (swift run, etc.).
+    private func maybeShowApprovalPromptOnce() {
+        // Always mark the launch check as complete before returning, so the
+        // status-bar badge can start honoring state updates regardless of
+        // whether this specific evaluation decided to show the alert.
+        defer { launchApprovalCheckComplete = true }
+        guard runningFromAppBundle,
+              !userDidUninstall,
+              !hasShownApprovalPromptThisLaunch,
+              helperService().status == .requiresApproval
+        else { return }
+        hasShownApprovalPromptThisLaunch = true
+
+        let alert = NSAlert()
+        alert.messageText = "ChillPill needs approval to read temperatures"
+        alert.informativeText = "Open System Settings → Login Items & Extensions and turn ChillPill on. Until then, the menu bar icon will show ⚠︎ and no temperatures will be available."
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Open Login Items")
+        alert.addButton(withTitle: "Not Now")
+        if alert.runModal() == .alertFirstButtonReturn {
+            openLoginItemsSettings()
         }
     }
 
@@ -323,6 +365,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func updateStatusTitle() {
+        // When SMAppService registration hasn't completed — either awaiting
+        // user approval after install, or not yet registered — signal that
+        // the app needs attention instead of showing a silent " --°". If the
+        // user deliberately uninstalled, suppress: they don't want the nag.
+        // Also gated on `launchApprovalCheckComplete` so we don't flicker
+        // " ⚠︎" in the brief window between app launch and the deferred
+        // approval-prompt evaluation.
+        if runningFromAppBundle, !userDidUninstall, launchApprovalCheckComplete {
+            let status = helperService().status
+            if status == .requiresApproval
+                || status == .notRegistered
+                || status == .notFound {
+                statusItem.button?.title = " ⚠︎"
+                return
+            }
+        }
         guard let hottest = hottestCPU(latestTemps) else {
             statusItem.button?.title = " --°"
             return
