@@ -29,6 +29,15 @@ final class SMC {
 
     static let shared = SMC()
 
+    /// Serial queue that must be used (via `.async` or `.sync`) for *every*
+    /// access to `SMC.shared`. The single `AppleSMC` userclient is not safe
+    /// under concurrent `IOServiceOpen` / `IOConnectCallStructMethod` calls,
+    /// and neither HelperImpl's XPC dispatch nor signal-handler cleanup
+    /// naturally serialize themselves otherwise. Callers should wrap
+    /// multi-call transactions (e.g. `Fans.setTarget`'s mode+target pair)
+    /// in a single `.async`/`.sync` block to preserve atomicity.
+    static let queue = DispatchQueue(label: "dev.chillpill.smc")
+
     /// Max bytes any SMC key can carry — matches the `bytes[32]` field in the
     /// 80-byte SMCParamStruct. Reads/writes exceeding this are rejected.
     static let maxPayloadSize = 32

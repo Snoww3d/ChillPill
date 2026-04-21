@@ -1,8 +1,8 @@
 # ChillPill
 
-A macOS menu bar app that shows internal temperatures and (eventually) controls fan speed.
+A macOS menu bar app that shows internal temperatures and controls fan speed, without hard-coded elevated privileges for the UI.
 
-> **Status:** early alpha. Temperature monitoring works on Apple Silicon. Fan control is in progress — the shippable privileged-helper architecture is tracked in [#1](https://github.com/Snoww3d/ChillPill/issues/1).
+> **Status:** alpha — the core read/write path works end-to-end on an M1 Pro 14" MacBook Pro. Tracked open issues: [#3](https://github.com/Snoww3d/ChillPill/issues/3) (split CPU group into P-cores / E-cores).
 
 ## Requirements
 
@@ -10,42 +10,69 @@ A macOS menu bar app that shows internal temperatures and (eventually) controls 
 - Apple Silicon (M-series) — Intel Macs are untested
 - Xcode Command Line Tools (`xcode-select --install`)
 
-That's it. No Xcode project, no CocoaPods, no Homebrew dependencies.
+No Homebrew dependencies. No Xcode project (SPM-driven).
 
 ## Build & run
 
 ```sh
 git clone https://github.com/Snoww3d/ChillPill.git
 cd ChillPill
-swift run ChillPill
+make
+open build/ChillPill.app
 ```
 
-A thermometer icon will appear in the menu bar with the hottest CPU-adjacent temperature. Click it for the full sensor list.
+On first launch macOS shows a "Background Items Added" banner.
+To enable fan control, go to **System Settings → Login Items & Extensions**
+and toggle **ChillPill** on. This approves the bundled helper daemon —
+after that, no password prompts, including across reboots.
+
+To install to your user applications folder:
+
+```sh
+make install          # copies the release build to ~/Applications/
+open ~/Applications/ChillPill.app
+```
 
 ## How it works
 
-- **Temperatures**: queried via `IOHIDEventSystemClient` against the `AppleVendor / TemperatureSensor` usage page. This is a private IOKit API that Apple's own system tools use; we forward-declare the symbols in a small C shim (`Sources/CChillPillIOKit`).
-- **Fan speed**: reads via the `AppleSMC` userclient (planned). Writes require root privileges on Apple Silicon and will be handled by a bundled privileged helper.
+The project is split across three SPM targets:
 
-## Project layout
+| Target             | Role                                            | Runs as |
+|---|---|---|
+| `ChillPill`        | Menu bar UI; no IOKit / SMC code                | user    |
+| `ChillPillHelper`  | SMC read/write, fan control, sensor enumeration | root    |
+| `ChillPillShared`  | XPC protocol + `Codable` DTOs                   | n/a     |
 
-```
-ChillPill/
-├── Package.swift                    # SPM manifest
-├── Sources/
-│   ├── CChillPillIOKit/             # C shim for private IOKit symbols
-│   └── ChillPill/                   # Swift menu bar app
-└── LICENSE
-```
+The UI and helper communicate over an `NSXPCConnection` against a
+registered Mach service. Fan control commands carry only indices and
+target RPMs — the helper validates input bounds, clamps to the
+advertised `[min, max]` range, and only ever writes the `F{n}Md` and
+`F{n}Tg` SMC keys (enforced by construction — no generic "write any
+key" method exists on the XPC surface).
 
-## Contributing
+**Temperatures** come from two sources which the helper merges:
+- `IOHIDEventSystemClient` → per-die sensors (P-cores, E-cores, GPU,
+  SoC, PMIC, ANE, ISP, battery, NAND). Friendly names from the
+  research in `Sources/ChillPillHelper/Sensors.swift`.
+- `AppleSMC` FourCC keys → location-based thermistors (palm rest,
+  airflow intakes, wireless, SSD area). Discovered at startup by
+  enumerating the SMC key table.
 
-PRs welcome. Please run `swift build` cleanly before opening one. Opening an issue first is appreciated for any non-trivial change.
+## Uninstalling
+
+From the menu: **ChillPill → Uninstall Helper** — calls
+`SMAppService.daemon.unregister()`, which removes the launchd job.
+Or, manually, in System Settings → Login Items & Extensions, toggle
+ChillPill off.
 
 ## Disclaimer
 
-Fan-control software pokes at undocumented hardware interfaces. Bugs here can in principle cause overheating or odd thermal behavior. Use at your own risk — there is no warranty (see [LICENSE](LICENSE)).
+Fan-control software pokes at undocumented hardware interfaces. Bugs
+here could in principle cause overheating or odd thermal behaviour.
+Use at your own risk — no warranty (see [LICENSE](LICENSE)). On app
+quit (including SIGTERM / SIGINT), the helper restores all fans to
+auto as a belt-and-braces safety net; `kill -9` bypasses this.
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE).
