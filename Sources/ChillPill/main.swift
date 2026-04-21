@@ -320,9 +320,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func hottestCPU(_ temps: [TemperatureDTO]) -> TemperatureDTO? {
+        // Prefer a raw P-core reading — hottest Firestorm/Avalanche/etc.
+        // sensor is the best headline number under CPU load.
         let pCores = temps.filter { $0.rawName.hasPrefix("pACC ") }
         if let hot = pCores.max(by: { $0.celsius < $1.celsius }) { return hot }
-        let cpuish = temps.filter { $0.group == .cpu }
+        // Fall back through any CPU-adjacent group before going to all temps.
+        let cpuGroups: Set<SensorGroup> = [.pcore, .ecore, .soc, .cpu]
+        let cpuish = temps.filter { cpuGroups.contains($0.group) }
         return (cpuish.isEmpty ? temps : cpuish).max { $0.celsius < $1.celsius }
     }
 
