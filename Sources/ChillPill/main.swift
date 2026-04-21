@@ -222,7 +222,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let submenu = NSMenu()
         submenu.delegate = self
         for r in readings {
-            submenu.addItem(disabled(String(format: "%@  %.1f°C", r.name, r.celsius)))
+            submenu.addItem(disabled(String(format: "%@  %.1f°C", r.displayName, r.celsius)))
         }
         item.submenu = submenu
         return item
