@@ -48,9 +48,12 @@ bundle: compile
 	@echo ""
 
 sign:
-	@codesign --force --sign - $(APP)/Contents/MacOS/ChillPillHelper
-	@codesign --force --sign - $(APP)/Contents/MacOS/ChillPill
-	@codesign --force --sign - $(APP)
+	@# Explicit identifiers so codesign doesn't auto-generate a
+	@# hash-based one for the loose helper Mach-O — SMAppService matches
+	@# the helper's signed identifier against the daemon plist's Label.
+	@codesign --force --sign - --identifier dev.chillpill.helper $(APP)/Contents/MacOS/ChillPillHelper
+	@codesign --force --sign - --identifier dev.chillpill.ChillPill $(APP)/Contents/MacOS/ChillPill
+	@codesign --force --sign - --identifier dev.chillpill.ChillPill $(APP)
 
 run: bundle
 	@open $(APP)

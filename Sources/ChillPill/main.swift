@@ -130,13 +130,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard runningFromAppBundle else { return }
         guard !userDidUninstall else { return }
         let service = helperService()
-        guard service.status == .notRegistered else { return }
+        // Register when the system hasn't seen the daemon yet. Both
+        // .notRegistered and .notFound mean "no current registration" — the
+        // Apple docs describe them as separate states, but in practice a
+        // fresh app install starts in .notFound and transitions to
+        // .requiresApproval after a successful register() call (the
+        // "Operation not permitted" NSError it throws in that case is
+        // actually the "waiting on the user to flip the Login Items switch"
+        // signal, not a hard failure).
+        guard service.status == .notRegistered || service.status == .notFound else {
+            return
+        }
         do {
             try service.register()
-            os_log("SMAppService helper registered", log: log, type: .info)
-        } catch {
-            os_log("SMAppService register failed: %{public}@",
-                   log: log, type: .error, error.localizedDescription)
+            os_log("SMAppService register() succeeded; status now %{public}d",
+                   log: log, type: .info, service.status.rawValue)
+        } catch let e as NSError {
+            // code=1 ("Operation not permitted") is the expected result when
+            // the user has not yet approved the daemon in Login Items; the
+            // registration itself is accepted and status moves to
+            // .requiresApproval. Treat any other error as a real failure.
+            if e.domain == "SMAppServiceErrorDomain", e.code == 1 {
+                os_log("SMAppService register queued for user approval",
+                       log: log, type: .info)
+            } else {
+                os_log("SMAppService register failed: %{public}@",
+                       log: log, type: .error, e.localizedDescription)
+            }
         }
     }
 
@@ -153,15 +173,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             try helperService().register()
             showAlert(
                 title: "Helper registered",
-                message: "Finish the install by opening System Settings → Login Items & Extensions and turning ChillPill on."
+                message: "Open System Settings → Login Items & Extensions and turn ChillPill on to finish the install."
             )
-        } catch {
-            os_log("manual helper install failed: %{public}@",
-                   log: log, type: .error, error.localizedDescription)
-            showAlert(
-                title: "Install failed",
-                message: error.localizedDescription
-            )
+        } catch let e as NSError {
+            if e.domain == "SMAppServiceErrorDomain", e.code == 1 {
+                // Expected — registration was accepted, user approval pending.
+                showAlert(
+                    title: "Helper installed — approval required",
+                    message: "Open System Settings → Login Items & Extensions and turn ChillPill on to finish the install."
+                )
+            } else {
+                os_log("manual helper install failed: %{public}@",
+                       log: log, type: .error, e.localizedDescription)
+                showAlert(
+                    title: "Install failed",
+                    message: e.localizedDescription
+                )
+            }
         }
         refresh()
     }
@@ -207,7 +235,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .notRegistered:     return "Helper: not installed"
         case .enabled:           return "Helper: running"
         case .requiresApproval:  return "Helper: awaiting approval in Settings"
-        case .notFound:          return "Helper: plist not found in bundle"
+        case .notFound:          return "Helper: not installed"
         @unknown default:        return "Helper: unknown status"
         }
     }
@@ -452,7 +480,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         switch helperService().status {
-        case .notRegistered:
+        case .notRegistered, .notFound:
             let install = NSMenuItem(title: "Install Helper…",
                                      action: #selector(installHelper(_:)),
                                      keyEquivalent: "")
@@ -475,8 +503,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                        keyEquivalent: "")
             uninstall.target = self
             menu.addItem(uninstall)
-        case .notFound:
-            menu.addItem(disabled("  Plist missing — rebuild the .app bundle"))
         @unknown default:
             break
         }
