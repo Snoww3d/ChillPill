@@ -91,6 +91,65 @@ final class SMC {
         return call(input) != nil
     }
 
+    /// Number of keys the SMC is willing to enumerate via `kSMCGetKeyFromIndex`.
+    /// Exposed as the special `#KEY` key (ui32). Returns nil on SMC error.
+    func keyCount() -> Int? {
+        guard let v = readDouble("#KEY"), v.isFinite, v >= 0 else { return nil }
+        return Int(v.rounded())
+    }
+
+    /// FourCC of the SMC key at the given index, or nil if the index is out
+    /// of range / the call failed. Unlike `read(_:)`, the key field of the
+    /// input struct is ignored — only `data32` (the index) matters.
+    func keyAtIndex(_ index: Int) -> String? {
+        guard ensureOpen(), index >= 0 else { return nil }
+        var buf = [UInt8](repeating: 0, count: Self.paramStructSize)
+        buf[42] = Self.kSMCGetKeyFromIndex
+        writeLE32(&buf, at: 44, UInt32(index))
+        guard let output = call(buf) else { return nil }
+        // The kernel writes the FourCC back into the `key` field at offset 0
+        // as a native UInt32 — on LE hosts the ascii chars appear reversed
+        // in the byte stream, same rule as `dataType` in getKeyInfo.
+        let u = readLE32(output, at: 0)
+        let bytes: [UInt8] = [
+            UInt8((u >> 24) & 0xff),
+            UInt8((u >> 16) & 0xff),
+            UInt8((u >>  8) & 0xff),
+            UInt8( u        & 0xff),
+        ]
+        return String(bytes: bytes, encoding: .ascii)
+    }
+
+    /// Everything the SMC knows about, discovered by enumerating indices
+    /// 0..keyCount. Intended to be called once at startup and cached — each
+    /// entry costs two SMC round-trips (index → key, key → keyInfo).
+    struct DiscoveredKey {
+        let key: String
+        let info: KeyInfo
+    }
+
+    func discoverAllKeys() -> [DiscoveredKey] {
+        guard let count = keyCount() else { return [] }
+        var result: [DiscoveredKey] = []
+        result.reserveCapacity(count)
+        for i in 0..<count {
+            guard let key = keyAtIndex(i),
+                  let info = getKeyInfo(key) else { continue }
+            result.append(DiscoveredKey(key: key, info: info))
+        }
+        return result
+    }
+
+    /// Faster variant of `read(_:)` for callers that already have the key's
+    /// KeyInfo cached from a previous `discoverAllKeys` — skips the per-call
+    /// `getKeyInfo` round-trip.
+    func readWithInfo(_ key: String, info: KeyInfo) -> Value? {
+        guard ensureOpen() else { return nil }
+        guard info.dataSize <= UInt32(Self.maxPayloadSize) else { return nil }
+        guard let bytes = readBytes(key, size: info.dataSize) else { return nil }
+        return Value(key: key, info: info, bytes: bytes)
+    }
+
     /// Encode a 32-bit float for an SMC `flt ` key. On Apple Silicon the
     /// SMC stores these little-endian (same as the host).
     static func encodeFLT(_ value: Float) -> [UInt8] {
@@ -173,6 +232,7 @@ final class SMC {
     private static let kSMCHandleYPCEvent: UInt32 = 2
     private static let kSMCReadKey: UInt8 = 5
     private static let kSMCWriteKey: UInt8 = 6
+    private static let kSMCGetKeyFromIndex: UInt8 = 8
     private static let kSMCGetKeyInfo: UInt8 = 9
 
     /// SMCParamStruct is 80 bytes. Relevant offsets:
