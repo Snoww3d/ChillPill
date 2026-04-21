@@ -666,21 +666,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: - Controller menu items
 
-    /// Preset setpoint choices for the "Target temperature" submenu. Kept
-    /// short — the `Custom…` entry covers everything else.
-    private static let setpointPresets: [Double] = [65, 72, 75, 80, 85]
+    /// Preset setpoint choices for the "Target temperature" submenu.
+    /// The low values (30, 40 °C) are sized for surface-temp targets
+    /// (Ambient / Palm sensor); the higher values are sized for silicon
+    /// (CPU / GPU). Mixing low preset + CPU sensor will pin fans to max,
+    /// which is the user's call.
+    private static let setpointPresets: [Double] = [30, 40, 65, 72, 75, 80, 85]
 
-    /// Sensor-selector choices for the picker submenu. Order matters; the
-    /// first entry in each pair is the default group for that role.
+    /// Sensor-selector choices for the picker submenu. All `max` variants
+    /// first, then all `avg` variants, split by a separator. Palm-rest /
+    /// skin sensors (`Ts*` SMC keys) land in the `.ambient` group, so
+    /// "Ambient" is the right pick if the user wants to cool based on
+    /// surface temperature instead of silicon temperature.
     private static let sensorChoices: [(label: String, selector: SensorSelector)] = [
-        ("P-Cores (max)", .groupMax(.pcore)),
-        ("E-Cores (max)", .groupMax(.ecore)),
-        ("SoC (max)",     .groupMax(.soc)),
+        ("P-Cores (max)",      .groupMax(.pcore)),
+        ("E-Cores (max)",      .groupMax(.ecore)),
+        ("SoC (max)",          .groupMax(.soc)),
         ("CPU fallback (max)", .groupMax(.cpu)),
-        ("P-Cores (avg)", .groupAvg(.pcore)),
-        ("E-Cores (avg)", .groupAvg(.ecore)),
-        ("SoC (avg)",     .groupAvg(.soc)),
-        ("CPU fallback (avg)", .groupAvg(.cpu))
+        ("GPU (max)",          .groupMax(.gpu)),
+        ("Memory (max)",       .groupMax(.memory)),
+        ("Storage (max)",      .groupMax(.storage)),
+        ("Battery (max)",      .groupMax(.battery)),
+        ("Ambient / Palm (max)", .groupMax(.ambient)),
+        ("P-Cores (avg)",      .groupAvg(.pcore)),
+        ("E-Cores (avg)",      .groupAvg(.ecore)),
+        ("SoC (avg)",          .groupAvg(.soc)),
+        ("CPU fallback (avg)", .groupAvg(.cpu)),
+        ("GPU (avg)",          .groupAvg(.gpu)),
+        ("Memory (avg)",       .groupAvg(.memory)),
+        ("Storage (avg)",      .groupAvg(.storage)),
+        ("Battery (avg)",      .groupAvg(.battery)),
+        ("Ambient / Palm (avg)", .groupAvg(.ambient))
     ]
 
     private func appendControllerItems(to menu: NSMenu) {
