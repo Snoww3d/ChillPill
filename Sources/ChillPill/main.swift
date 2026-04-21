@@ -1,50 +1,48 @@
 import AppKit
 import ServiceManagement
+import os.log
 import ChillPillShared
 
 /// Filename of the launchd plist inside `Contents/Library/LaunchDaemons/`.
-/// Must match the file committed at `Resources/dev.chillpill.helper.plist`
-/// and the name copied by the Makefile into the .app bundle.
 private let helperPlistName = "dev.chillpill.helper.plist"
 
-/// Carries the target we want to apply when a fan preset menu item is clicked.
-final class FanAction: NSObject {
-    enum Scope {
-        case one(Int)
-        case all
-    }
-    let scope: Scope
-    /// .one: absolute RPM (nil = auto).  .all: percentage 0-100 (nil = auto).
-    let value: Double?
+/// UserDefaults key: set when the user has explicitly uninstalled the
+/// helper. Suppresses the auto-register-on-launch behavior so re-launch
+/// doesn't surprise the user with a second "Background Items Added" prompt.
+private let uninstallFlagKey = "ChillPill.UserDidUninstallHelper"
 
-    init(scope: Scope, value: Double?) {
-        self.scope = scope
-        self.value = value
-    }
+/// Describes exactly one action the menu can request. Each case carries the
+/// data its XPC call needs — no overloaded `Double?` whose meaning depends
+/// on a sibling enum, so the `applyFanAction` switch is exhaustive and
+/// unit-safe (RPM vs percent can't be confused).
+enum FanAction {
+    case setAuto(index: Int)
+    case setTargetRPM(index: Int, rpm: Double)
+    case setAllAuto
+    case setAllPercent(Double)
+}
+
+/// Box for `NSMenuItem.representedObject` — NSMenuItem requires a reference
+/// type, so we wrap the enum.
+final class FanActionBox: NSObject {
+    let action: FanAction
+    init(_ action: FanAction) { self.action = action }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+    private let log = OSLog(subsystem: "dev.chillpill", category: "App")
+
     private var statusItem: NSStatusItem!
     private var timer: Timer?
 
     private var sigtermSource: DispatchSourceSignal?
     private var sigintSource: DispatchSourceSignal?
 
-    /// Count of currently-open menus (root + submenus). Non-zero means we
-    /// should skip menu rebuilds to avoid dismissing what the user is
-    /// tracking.
     private var menuOpenCount = 0
 
-    /// When non-nil and in the future, refresh() leaves the status-bar title
-    /// alone so a transient toast stays visible.
     private var suppressTitleUpdateUntil: Date?
-
-    /// Gate so both SIGTERM and SIGINT can't both invoke the shutdown path.
     private var fatalSignalFired = false
 
-    /// Latest snapshots returned by the helper. The refresh() method fires
-    /// two XPC calls and the replies populate these independently; the menu
-    /// rebuild runs whenever either one arrives.
     private var latestFans: [FanDTO] = []
     private var latestTemps: [TemperatureDTO] = []
 
@@ -69,11 +67,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        // Best-effort: tell the helper to restore auto. The helper also runs
-        // its own signal handler so this is belt-and-braces.
-        let sem = DispatchSemaphore(value: 0)
-        HelperClient.shared.prepareForShutdown { _ in sem.signal() }
-        _ = sem.wait(timeout: .now() + 1.0)
+        // Fire-and-forget — blocking on a DispatchSemaphore here would
+        // deadlock the main queue against its own async reply. The helper
+        // has its own SIGTERM handler that restores fans, so this is a
+        // secondary safety net at best.
+        HelperClient.shared.prepareForShutdown()
     }
 
     // MARK: - Signals
@@ -96,44 +94,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func handleFatalSignal() {
         guard !fatalSignalFired else { return }
         fatalSignalFired = true
-        let sem = DispatchSemaphore(value: 0)
-        HelperClient.shared.prepareForShutdown { _ in sem.signal() }
-        _ = sem.wait(timeout: .now() + 1.0)
+        HelperClient.shared.prepareForShutdown()
+        // Give the XPC message a brief moment to depart the socket before
+        // we exit — no semaphore, no deadlock.
+        Thread.sleep(forTimeInterval: 0.1)
         exit(0)
-    }
-
-    // MARK: - NSMenuDelegate
-
-    func menuWillOpen(_ menu: NSMenu) {
-        menuOpenCount += 1
-    }
-
-    func menuDidClose(_ menu: NSMenu) {
-        menuOpenCount = max(0, menuOpenCount - 1)
     }
 
     // MARK: - Helper lifecycle (SMAppService)
 
     /// True when running from a proper `.app` bundle — SMAppService can only
-    /// register daemons bundled inside an app. `swift run` from the repo
-    /// root will return false; in that mode we can still talk to a
-    /// manually-launched helper but can't register one.
+    /// register daemons bundled inside an app. `swift run` and bare
+    /// executables return false; in that mode we can talk to a
+    /// manually-launched helper but can't auto-register one.
     private var runningFromAppBundle: Bool {
-        Bundle.main.bundlePath.hasSuffix(".app")
+        Bundle.main.bundleIdentifier == "dev.chillpill.ChillPill"
+    }
+
+    private var userDidUninstall: Bool {
+        get { UserDefaults.standard.bool(forKey: uninstallFlagKey) }
+        set { UserDefaults.standard.set(newValue, forKey: uninstallFlagKey) }
     }
 
     private func helperService() -> SMAppService {
         SMAppService.daemon(plistName: helperPlistName)
     }
 
-    /// On first launch, attempt to register the helper automatically. macOS
-    /// will show a "Background Items Added" notification; the user still
-    /// has to flip the switch in System Settings → Login Items.
+    /// On first launch (or any launch when the helper has never been
+    /// registered), kick off `register()`. macOS then shows the
+    /// "Background Items Added" banner; the user approves in Settings.
+    ///
+    /// Skipped if the user has explicitly uninstalled — re-installing
+    /// requires them to click the menu item explicitly.
     private func autoRegisterHelperIfNeeded() {
         guard runningFromAppBundle else { return }
+        guard !userDidUninstall else { return }
         let service = helperService()
-        if service.status == .notRegistered {
-            try? service.register()
+        guard service.status == .notRegistered else { return }
+        do {
+            try service.register()
+            os_log("SMAppService helper registered", log: log, type: .info)
+        } catch {
+            os_log("SMAppService register failed: %{public}@",
+                   log: log, type: .error, error.localizedDescription)
         }
     }
 
@@ -145,6 +148,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             )
             return
         }
+        userDidUninstall = false
         do {
             try helperService().register()
             showAlert(
@@ -152,6 +156,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 message: "Finish the install by opening System Settings → Login Items & Extensions and turning ChillPill on."
             )
         } catch {
+            os_log("manual helper install failed: %{public}@",
+                   log: log, type: .error, error.localizedDescription)
             showAlert(
                 title: "Install failed",
                 message: error.localizedDescription
@@ -163,11 +169,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func uninstallHelper(_ sender: NSMenuItem) {
         do {
             try helperService().unregister()
+            userDidUninstall = true
             showAlert(
                 title: "Helper uninstalled",
                 message: "The ChillPill helper daemon has been unregistered. Fan control is disabled until you re-install."
             )
         } catch {
+            os_log("helper uninstall failed: %{public}@",
+                   log: log, type: .error, error.localizedDescription)
             showAlert(
                 title: "Uninstall failed",
                 message: error.localizedDescription
@@ -177,7 +186,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func openLoginItemsSettings(_ sender: NSMenuItem) {
-        // URL scheme Apple documents for the Login Items pane.
         if let url = URL(string: "x-apple.systempreferences:com.apple.LoginItems-Settings.extension") {
             NSWorkspace.shared.open(url)
         }
@@ -202,6 +210,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .notFound:          return "Helper: plist not found in bundle"
         @unknown default:        return "Helper: unknown status"
         }
+    }
+
+    // MARK: - NSMenuDelegate
+
+    func menuWillOpen(_ menu: NSMenu) {
+        menuOpenCount += 1
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        menuOpenCount = max(0, menuOpenCount - 1)
     }
 
     // MARK: - Refresh (XPC-driven)
@@ -273,7 +291,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.button?.title = String(format: " %.0f°", hottest.celsius)
     }
 
-    /// Headline CPU temperature: hottest P-core > hottest .cpu sensor > hottest overall.
     private func hottestCPU(_ temps: [TemperatureDTO]) -> TemperatureDTO? {
         let pCores = temps.filter { $0.rawName.hasPrefix("pACC ") }
         if let hot = pCores.max(by: { $0.celsius < $1.celsius }) { return hot }
@@ -307,7 +324,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                               action: #selector(applyFanAction(_:)),
                               keyEquivalent: "")
         auto.target = self
-        auto.representedObject = FanAction(scope: .all, value: nil)
+        auto.representedObject = FanActionBox(.setAllAuto)
         auto.state = allAuto ? .on : .off
         submenu.addItem(auto)
 
@@ -327,7 +344,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                  action: #selector(applyFanAction(_:)),
                                  keyEquivalent: "")
             itm.target = self
-            itm.representedObject = FanAction(scope: .all, value: Double(pct))
+            itm.representedObject = FanActionBox(.setAllPercent(Double(pct)))
             submenu.addItem(itm)
         }
         item.submenu = submenu
@@ -395,7 +412,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                               action: #selector(applyFanAction(_:)),
                               keyEquivalent: "")
         auto.target = self
-        auto.representedObject = FanAction(scope: .one(f.index), value: nil)
+        auto.representedObject = FanActionBox(.setAuto(index: f.index))
         auto.state = (f.mode == 0) ? .on : .off
         submenu.addItem(auto)
 
@@ -417,7 +434,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                       action: #selector(applyFanAction(_:)),
                                       keyEquivalent: "")
                 item.target = self
-                item.representedObject = FanAction(scope: .one(f.index), value: rpm)
+                item.representedObject = FanActionBox(.setTargetRPM(index: f.index, rpm: rpm))
                 submenu.addItem(item)
             }
         } else if let mn = f.minRPM, let mx = f.maxRPM {
@@ -428,47 +445,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return submenu
     }
 
-    // MARK: - Actions
-
-    @objc private func applyFanAction(_ sender: NSMenuItem) {
-        guard let action = sender.representedObject as? FanAction else { return }
-        let handler: (String?) -> Void = { [weak self] errMessage in
-            if let msg = errMessage { self?.notifyWriteRejected(reason: msg) }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
-                self?.refresh()
-            }
-        }
-        switch action.scope {
-        case .one(let idx):
-            if let rpm = action.value {
-                HelperClient.shared.setFanTarget(index: idx, rpm: rpm, completion: handler)
-            } else {
-                HelperClient.shared.setFanAuto(index: idx, completion: handler)
-            }
-        case .all:
-            if let pct = action.value {
-                HelperClient.shared.setAllFansTarget(pct: pct, completion: handler)
-            } else {
-                HelperClient.shared.setAllFansAuto(completion: handler)
-            }
-        }
-    }
-
-    private func notifyWriteRejected(reason: String) {
-        guard let button = statusItem.button else { return }
-        button.title = " ⚠︎ \(reason)"
-        let expiry: TimeInterval = 2.5
-        suppressTitleUpdateUntil = Date().addingTimeInterval(expiry)
-        DispatchQueue.main.asyncAfter(deadline: .now() + expiry + 0.05) { [weak self] in
-            self?.refresh()
-        }
-    }
-
     // MARK: - Helper lifecycle menu items
 
     private func appendHelperLifecycleItems(to menu: NSMenu) {
         guard runningFromAppBundle else {
-            return  // SPM dev mode — no SMAppService actions available
+            return
         }
         switch helperService().status {
         case .notRegistered:
@@ -498,6 +479,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(disabled("  Plist missing — rebuild the .app bundle"))
         @unknown default:
             break
+        }
+    }
+
+    // MARK: - Actions
+
+    @objc private func applyFanAction(_ sender: NSMenuItem) {
+        guard let box = sender.representedObject as? FanActionBox else { return }
+        let handler: (NSError?) -> Void = { [weak self] err in
+            if let err = err {
+                self?.notifyWriteRejected(reason: err.localizedDescription)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                self?.refresh()
+            }
+        }
+        switch box.action {
+        case .setAuto(let index):
+            HelperClient.shared.setFanAuto(index: index, completion: handler)
+        case .setTargetRPM(let index, let rpm):
+            HelperClient.shared.setFanTarget(index: index, rpm: rpm, completion: handler)
+        case .setAllAuto:
+            HelperClient.shared.setAllFansAuto(completion: handler)
+        case .setAllPercent(let pct):
+            HelperClient.shared.setAllFansTarget(pct: pct, completion: handler)
+        }
+    }
+
+    private func notifyWriteRejected(reason: String) {
+        guard let button = statusItem.button else { return }
+        button.title = " ⚠︎ \(reason)"
+        let expiry: TimeInterval = 2.5
+        suppressTitleUpdateUntil = Date().addingTimeInterval(expiry)
+        DispatchQueue.main.asyncAfter(deadline: .now() + expiry + 0.05) { [weak self] in
+            self?.refresh()
         }
     }
 
