@@ -58,6 +58,66 @@ public struct TemperatureDTO: Codable, Sendable {
     }
 }
 
+// MARK: - Target-temperature controller (issue #10)
+
+/// Which temperature reading the controller tracks. v1 is group-based — a
+/// future version can add `.rawName(String)` for specific-sensor selection.
+public enum SensorSelector: Codable, Sendable, Equatable {
+    /// Hottest sensor in the group (`max` of `.celsius`). Default choice for
+    /// thermal control — the system is limited by its hottest die, not its
+    /// average die.
+    case groupMax(SensorGroup)
+    /// Arithmetic mean across the group. Quieter signal, slower response.
+    case groupAvg(SensorGroup)
+}
+
+/// Predefined PI gain triple. Presets keep the v1 UI simple — users pick one
+/// of three labels instead of tweaking raw Kp/Ki fields.
+public enum ControlPreset: String, Codable, Sendable, CaseIterable {
+    case conservative
+    case balanced
+    case aggressive
+}
+
+/// Live state of the fan controller, returned by `getControlState`. The
+/// "current" fields are sampled from the most recent tick; they are nil
+/// before the first tick completes or when the selected sensor group has
+/// no readings.
+public struct ControlStateDTO: Codable, Sendable {
+    public let enabled: Bool
+    public let resumeOnLaunch: Bool
+    public let sensor: SensorSelector
+    public let setpointCelsius: Double
+    public let preset: ControlPreset
+    public let currentReadingCelsius: Double?
+    public let currentErrorCelsius: Double?
+    public let lastOutputPercent: Double?
+    /// When non-nil, the controller self-disabled because of this condition
+    /// (sensor group went empty, fan range unknown, etc.). The UI surfaces
+    /// this so the user knows why the controller is off.
+    public let fallbackReason: String?
+
+    public init(enabled: Bool,
+                resumeOnLaunch: Bool,
+                sensor: SensorSelector,
+                setpointCelsius: Double,
+                preset: ControlPreset,
+                currentReadingCelsius: Double?,
+                currentErrorCelsius: Double?,
+                lastOutputPercent: Double?,
+                fallbackReason: String?) {
+        self.enabled = enabled
+        self.resumeOnLaunch = resumeOnLaunch
+        self.sensor = sensor
+        self.setpointCelsius = setpointCelsius
+        self.preset = preset
+        self.currentReadingCelsius = currentReadingCelsius
+        self.currentErrorCelsius = currentErrorCelsius
+        self.lastOutputPercent = lastOutputPercent
+        self.fallbackReason = fallbackReason
+    }
+}
+
 /// XPC protocol the helper exposes to the UI app. Defined as `@objc` because
 /// `NSXPCConnection` requires Objective-C protocol semantics.
 ///
@@ -88,6 +148,29 @@ public struct TemperatureDTO: Codable, Sendable {
     /// Called by the UI on clean quit as a belt-and-braces safety net;
     /// the helper's own signal handling also calls this.
     func prepareForShutdown(reply: @escaping (NSError?) -> Void)
+
+    // MARK: - Target-temperature controller (issue #10)
+
+    /// JSON-encoded `ControlStateDTO`. Always non-nil when no error.
+    func getControlState(reply: @escaping (Data?, NSError?) -> Void)
+
+    /// Turn the controller on or off. Disabling immediately returns all fans
+    /// to auto and clears any fallback reason. Enabling is rejected if the
+    /// selected sensor group currently has no readings.
+    func setControlEnabled(_ enabled: Bool, reply: @escaping (NSError?) -> Void)
+
+    /// Setpoint in °C. Rejected if non-finite or outside `[20, 110]`.
+    func setControlSetpoint(_ celsius: Double, reply: @escaping (NSError?) -> Void)
+
+    /// JSON-encoded `SensorSelector`. Rejected if decode fails.
+    func setControlSensor(selectorData: Data, reply: @escaping (NSError?) -> Void)
+
+    /// Preset name matching one of `ControlPreset.rawValue`.
+    func setControlPreset(_ presetName: String, reply: @escaping (NSError?) -> Void)
+
+    /// If true, the controller will re-enable itself with the persisted
+    /// config on the next helper launch. Default false.
+    func setControlResumeOnLaunch(_ enabled: Bool, reply: @escaping (NSError?) -> Void)
 }
 
 /// Shared helper-error domain for the NSError objects returned by the XPC
@@ -101,6 +184,11 @@ public enum ChillPillHelperErrorCode: Int {
     case smcReadFailed       = 5
     case keyNotAllowed       = 6
     case notAuthorized       = 7
+    // Controller errors (issue #10)
+    case invalidSetpoint     = 10
+    case invalidSensor       = 11
+    case invalidPreset       = 12
+    case sensorUnavailable   = 13
     case internalFailure     = 99
 }
 

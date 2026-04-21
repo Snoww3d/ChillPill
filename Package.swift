@@ -29,6 +29,11 @@ let package = Package(
             name: "ChillPill",
             dependencies: ["ChillPillShared"],
             path: "Sources/ChillPill"
+        ),
+        .testTarget(
+            name: "ChillPillSharedTests",
+            dependencies: ["ChillPillShared"],
+            path: "Tests/ChillPillSharedTests"
         )
     ]
 )

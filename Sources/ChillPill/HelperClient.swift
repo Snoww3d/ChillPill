@@ -166,6 +166,68 @@ final class HelperClient {
         p.prepareForShutdown { _ in }
     }
 
+    // MARK: - Target-temperature controller (issue #10)
+
+    func getControlState(completion: @escaping (ControlStateDTO?) -> Void) {
+        guard let p = proxy(errorHandler: { [weak self] err in
+            self?.setStatus(.error(err.localizedDescription))
+            self?.onMain(nil, completion)
+        }) else {
+            setStatus(.notInstalled)
+            onMain(nil, completion)
+            return
+        }
+        p.getControlState { [weak self] data, err in
+            guard let data = data, err == nil,
+                  let state = try? JSONDecoder().decode(ControlStateDTO.self, from: data) else {
+                self?.setStatus(.error(err?.localizedDescription ?? "bad control-state payload"))
+                self?.onMain(nil, completion)
+                return
+            }
+            self?.setStatus(.running)
+            self?.onMain(state, completion)
+        }
+    }
+
+    func setControlEnabled(_ enabled: Bool, completion: @escaping (NSError?) -> Void) {
+        writeCall(completion: completion) { proxy, reply in
+            proxy.setControlEnabled(enabled, reply: reply)
+        }
+    }
+
+    func setControlSetpoint(_ celsius: Double, completion: @escaping (NSError?) -> Void) {
+        writeCall(completion: completion) { proxy, reply in
+            proxy.setControlSetpoint(celsius, reply: reply)
+        }
+    }
+
+    func setControlSensor(_ selector: SensorSelector, completion: @escaping (NSError?) -> Void) {
+        let data: Data
+        do {
+            data = try JSONEncoder().encode(selector)
+        } catch {
+            onMain(chillPillHelperError(.invalidSensor,
+                "encode SensorSelector: \(error.localizedDescription)"),
+                completion)
+            return
+        }
+        writeCall(completion: completion) { proxy, reply in
+            proxy.setControlSensor(selectorData: data, reply: reply)
+        }
+    }
+
+    func setControlPreset(_ preset: ControlPreset, completion: @escaping (NSError?) -> Void) {
+        writeCall(completion: completion) { proxy, reply in
+            proxy.setControlPreset(preset.rawValue, reply: reply)
+        }
+    }
+
+    func setControlResumeOnLaunch(_ flag: Bool, completion: @escaping (NSError?) -> Void) {
+        writeCall(completion: completion) { proxy, reply in
+            proxy.setControlResumeOnLaunch(flag, reply: reply)
+        }
+    }
+
     // MARK: - Helpers
 
     private func writeCall(
