@@ -56,6 +56,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// launch and the deferred main-queue block that evaluates state.
     private var launchApprovalCheckComplete = false
 
+    /// Counts consecutive `refresh()` cycles where `SMAppService` says the
+    /// helper is `.enabled` but the XPC proxy is erroring or unavailable.
+    /// This is the signature of a stale launchd registration from a
+    /// reinstall — issue #8, and specifically the `copy_bundle_path` spawn
+    /// loop variant — that the system won't recover from on its own.
+    private var consecutiveXPCFailuresWhileEnabled: Int = 0
+    /// Threshold before auto-recovery fires. At 2-second refresh cadence,
+    /// 7 cycles = 14 seconds — past a typical first-spawn window, past
+    /// wake-from-sleep where the XPC connection is briefly interrupted,
+    /// and still well under "user notices and files a bug." launchd's
+    /// own retry interval in the spawn-loop case is ~10 s.
+    private static let staleHelperFailureThreshold = 7
+    /// One-shot per launch — a recovery attempt either works (next refresh
+    /// succeeds and the counter resets) or it doesn't, in which case we
+    /// don't want to keep nagging the user with the same modal.
+    private var hasAttemptedStaleHelperRecoveryThisLaunch = false
+
     private var latestFans: [FanDTO] = []
     private var latestTemps: [TemperatureDTO] = []
     private var latestControlState: ControlStateDTO?
@@ -282,6 +299,124 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         alert.runModal()
     }
 
+    /// Detects the stale-registration failure mode described in issue #8:
+    /// `SMAppService` reports `.enabled` but XPC calls keep failing because
+    /// launchd's bundle-UUID → path mapping is orphaned (typically after a
+    /// reinstall at a different path or with a new ad-hoc signature). We
+    /// can't see launchd's spawn-loop directly from the UI process, but we
+    /// can see its signature: approved status + persistent XPC failures.
+    private func checkHelperHealth() {
+        guard runningFromAppBundle, !userDidUninstall else {
+            consecutiveXPCFailuresWhileEnabled = 0
+            return
+        }
+        let smStatus = helperService().status
+        guard smStatus == .enabled else {
+            // Any non-`.enabled` state is already surfaced via the ⚠︎ badge
+            // and the existing approval-prompt flow; don't attribute those
+            // cases to stale registration.
+            consecutiveXPCFailuresWhileEnabled = 0
+            // Re-fire the approval modal if the user is stuck in
+            // `.requiresApproval` and the launch-time one-shot has been
+            // rearmed (which `attemptStaleHelperRecovery` does so the user
+            // isn't left with a silent ⚠︎ if they dismiss Login Items
+            // without approving). Gated on `launchApprovalCheckComplete`
+            // so the deferred launch-time prompt in
+            // `applicationDidFinishLaunching` always wins first — the
+            // synchronous `refresh()` there would otherwise race this
+            // path and block app startup on a modal.
+            // `maybeShowApprovalPromptOnce` is itself guarded against
+            // double-firing via `hasShownApprovalPromptThisLaunch`.
+            if smStatus == .requiresApproval,
+               launchApprovalCheckComplete,
+               !hasShownApprovalPromptThisLaunch,
+               menuOpenCount == 0 {
+                maybeShowApprovalPromptOnce()
+            }
+            return
+        }
+        switch HelperClient.shared.lastStatus {
+        case .running:
+            consecutiveXPCFailuresWhileEnabled = 0
+        case .error, .notInstalled:
+            consecutiveXPCFailuresWhileEnabled += 1
+            if consecutiveXPCFailuresWhileEnabled >= Self.staleHelperFailureThreshold,
+               !hasAttemptedStaleHelperRecoveryThisLaunch {
+                // Don't fire the modal while the user has the menu bar
+                // dropdown open — NSAlert.runModal steals focus and
+                // dismisses any active menu tracking session, which is
+                // jarring mid-interaction. Stay at the threshold and
+                // retry on the next refresh (the one-shot guard is
+                // tripped only when we *actually* show the alert).
+                guard menuOpenCount == 0 else { return }
+                hasAttemptedStaleHelperRecoveryThisLaunch = true
+                os_log("helper appears stuck (enabled + %d XPC failures) — offering recovery",
+                       log: log, type: .error, consecutiveXPCFailuresWhileEnabled)
+                showStaleHelperRecoveryAlert()
+            }
+        case .unknown:
+            // Pre-first-call window — don't penalize the grace period.
+            break
+        }
+    }
+
+    private func showStaleHelperRecoveryAlert() {
+        let alert = NSAlert()
+        alert.messageText = "ChillPill's helper isn't responding"
+        alert.informativeText = """
+            The helper is approved in Login Items, but it isn't answering. \
+            This usually means the app was replaced (e.g. via a new build) \
+            and the background registration is stale.
+
+            Click "Reset" to unregister and re-register the helper. You'll \
+            need to approve it once more in Login Items & Extensions.
+            """
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Reset")
+        alert.addButton(withTitle: "Not Now")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        attemptStaleHelperRecovery()
+    }
+
+    private func attemptStaleHelperRecovery() {
+        let service = helperService()
+        // `unregister()` may throw if state is ambiguous; swallow — the
+        // register call below is the real recovery and tolerates either
+        // "was registered, now isn't" or "wasn't registered to begin with".
+        do {
+            try service.unregister()
+        } catch {
+            os_log("stale-helper recovery: unregister warning: %{public}@",
+                   log: log, type: .info, error.localizedDescription)
+        }
+        do {
+            try service.register()
+            os_log("stale-helper recovery: register() succeeded; status=%d",
+                   log: log, type: .info, service.status.rawValue)
+        } catch let e as NSError {
+            // Expected path — register throws code=1 while the user has not
+            // yet flipped the Login Items switch; the service transitions
+            // to .requiresApproval and our existing status-bar ⚠︎ plus the
+            // Login Items deep-link below carry the rest of the recovery.
+            if e.domain == "SMAppServiceErrorDomain", e.code == 1 {
+                os_log("stale-helper recovery: awaiting user approval",
+                       log: log, type: .info)
+            } else {
+                os_log("stale-helper recovery: register failed: %{public}@",
+                       log: log, type: .error, e.localizedDescription)
+            }
+        }
+        consecutiveXPCFailuresWhileEnabled = 0
+        // After recovery, state is almost certainly `.requiresApproval`.
+        // Rearm the approval-prompt one-shot so that if the user dismisses
+        // the Login Items pane without approving, the existing approval
+        // modal can still nudge them on a later refresh — without this, a
+        // dismissed recovery leaves the app in silent-⚠︎ mode with no
+        // further prompt until quit-and-relaunch.
+        hasShownApprovalPromptThisLaunch = false
+        openLoginItemsSettings()
+    }
+
     private func helperStatusLine() -> String {
         guard runningFromAppBundle else {
             return "Helper: running outside .app bundle (SMAppService disabled)"
@@ -308,6 +443,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: - Refresh (XPC-driven)
 
     private func refresh() {
+        // Sample the state left by the *previous* refresh cycle before
+        // firing a new one. This is the right moment to detect the
+        // "SMAppService says enabled but XPC keeps failing" stale-
+        // registration pattern from issue #8.
+        checkHelperHealth()
+
         HelperClient.shared.fans { [weak self] fans in
             self?.latestFans = fans
             self?.rebuildMenu()
