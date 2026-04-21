@@ -106,6 +106,29 @@ enum Fans {
         }
     }
 
+    /// Apply the same percentage (0-100) to every fan, scaled against each
+    /// fan's *own* advertised [Min, Max] range. Fans whose range is unknown
+    /// or degenerate are skipped; the return value reflects whether every
+    /// fan accepted its write.
+    @discardableResult
+    static func setAllTargets(pct: Double) -> Bool {
+        guard pct.isFinite else { return false }
+        let clampedPct = min(max(pct, 0), 100)
+        let n = count()
+        guard n > 0 else { return false }
+        var allOK = true
+        for i in 0..<n {
+            let reading = read(i)
+            guard let mn = reading.minRPM, let mx = reading.maxRPM, mx > mn else {
+                allOK = false
+                continue
+            }
+            let rpm = mn + (mx - mn) * clampedPct / 100.0
+            if !setTarget(i, rpm: rpm) { allOK = false }
+        }
+        return allOK
+    }
+
     // MARK: - Helpers
 
     private static func isValidIndex(_ index: Int) -> Bool {

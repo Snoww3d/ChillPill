@@ -6,6 +6,18 @@ struct ThermalReading {
     let celsius: Double
 }
 
+/// High-level category a thermal sensor belongs to, used to group the menu
+/// dropdown. Order here is the display order in the menu.
+enum SensorGroup: String, CaseIterable {
+    case cpu     = "CPU"
+    case gpu     = "GPU"
+    case memory  = "Memory"
+    case storage = "Storage"
+    case battery = "Battery"
+    case ambient = "Ambient"
+    case other   = "Other"
+}
+
 enum Sensors {
     /// HID usage page / usage identifying Apple thermal sensors.
     /// 0xFF00 = kHIDPage_AppleVendor, 0x0005 = temperature sensor.
@@ -51,11 +63,51 @@ enum Sensors {
 
     /// Best-effort "CPU hot spot" — max of sensors whose name suggests CPU/SoC/die.
     static func hottestCPU(_ readings: [ThermalReading]) -> ThermalReading? {
-        let cpuish = readings.filter {
-            let n = $0.name.lowercased()
-            return n.contains("cpu") || n.contains("pmp") || n.contains("soc")
-                || n.contains("pecpu") || n.contains("ecpu")
-        }
+        let cpuish = readings.filter { group(for: $0) == .cpu }
         return (cpuish.isEmpty ? readings : cpuish).max { $0.celsius < $1.celsius }
+    }
+
+    /// Heuristically classify a thermal sensor by name. Keywords are
+    /// lower-cased and checked in priority order so, e.g., an "SSD CPU
+    /// controller" ends up in .storage rather than .cpu. Order of the
+    /// `case` arms matters.
+    static func group(for reading: ThermalReading) -> SensorGroup {
+        let n = reading.name.lowercased()
+        // Storage first so names like "NAND CPU Die" route to storage.
+        if n.contains("ssd") || n.contains("nand")
+            || n.contains("flash") || n.contains("storage") {
+            return .storage
+        }
+        if n.contains("battery") || n.contains("charger")
+            || n.contains("gas gauge") || n.contains("gas guage") /* typo seen on some boards */ {
+            return .battery
+        }
+        if n.contains("ambient") {
+            return .ambient
+        }
+        if n.contains("gpu") {
+            return .gpu
+        }
+        if n.contains("cpu") || n.contains("pecpu") || n.contains("ecpu")
+            || n.contains("pcpu") || n.contains("pmp") || n.contains("soc")
+            || n.contains("efuse")
+            // M-series cluster sensors are named "pACC"/"eACC".
+            || n.contains("pacc") || n.contains("eacc") {
+            return .cpu
+        }
+        if n.contains("dram") || n.contains("memory") || n.contains("mem ") {
+            return .memory
+        }
+        return .other
+    }
+
+    /// Returns readings grouped by `SensorGroup`, preserving the order
+    /// defined in `SensorGroup.allCases`. Empty groups are omitted.
+    static func grouped(_ readings: [ThermalReading]) -> [(SensorGroup, [ThermalReading])] {
+        let byGroup = Dictionary(grouping: readings, by: { group(for: $0) })
+        return SensorGroup.allCases.compactMap { g in
+            guard let list = byGroup[g], !list.isEmpty else { return nil }
+            return (g, list.sorted { $0.name < $1.name })
+        }
     }
 }

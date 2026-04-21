@@ -2,14 +2,23 @@ import AppKit
 
 /// Carries the target we want to apply when a fan preset menu item is clicked.
 /// Stored on `NSMenuItem.representedObject`.
+///
+/// `scope == .one(i)`: `value` is an absolute target RPM for fan `i`
+/// (or nil for "return fan i to auto").
+///
+/// `scope == .all`: `value` is a percentage (0–100) applied against each
+/// fan's *own* [Min, Max] range (or nil for "all fans to auto").
 final class FanAction: NSObject {
-    let fanIndex: Int
-    /// nil means "return to auto".
-    let targetRPM: Double?
+    enum Scope {
+        case one(Int)
+        case all
+    }
+    let scope: Scope
+    let value: Double?
 
-    init(fanIndex: Int, targetRPM: Double?) {
-        self.fanIndex = fanIndex
-        self.targetRPM = targetRPM
+    init(scope: Scope, value: Double?) {
+        self.scope = scope
+        self.value = value
     }
 }
 
@@ -133,15 +142,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if fans.isEmpty {
             menu.addItem(disabled("  No fans reported"))
         } else {
+            menu.addItem(allFansMenuItem(fans: fans))
             for f in fans {
                 menu.addItem(fanMenuItem(for: f))
             }
-            menu.addItem(NSMenuItem.separator())
-            let restoreAll = NSMenuItem(title: "Restore all fans to Auto",
-                                        action: #selector(restoreAllAuto(_:)),
-                                        keyEquivalent: "")
-            restoreAll.target = self
-            menu.addItem(restoreAll)
         }
 
         menu.addItem(NSMenuItem.separator())
@@ -150,8 +154,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if readings.isEmpty {
             menu.addItem(disabled("  No sensors found"))
         } else {
-            for r in readings {
-                menu.addItem(disabled(String(format: "  %@  %.1f°C", r.name, r.celsius)))
+            for (group, list) in Sensors.grouped(readings) {
+                menu.addItem(temperatureGroupItem(group: group, readings: list))
             }
         }
 
@@ -160,6 +164,68 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                 action: #selector(NSApplication.terminate(_:)),
                                 keyEquivalent: "q"))
         statusItem.menu = menu
+    }
+
+    /// The "All Fans" header row. Shows a summary (avg actual RPM across
+    /// reporting fans) and opens a submenu with Auto + preset percentages
+    /// applied uniformly.
+    private func allFansMenuItem(fans: [FanReading]) -> NSMenuItem {
+        let rpms = fans.map { $0.actualRPM }
+        let avgRPM = rpms.isEmpty ? 0 : rpms.reduce(0, +) / Double(rpms.count)
+        let allAuto = fans.allSatisfy { $0.mode == 0 }
+        let summary = allAuto
+            ? String(format: "All fans: %.0f RPM avg — auto", avgRPM)
+            : String(format: "All fans: %.0f RPM avg", avgRPM)
+        let item = NSMenuItem(title: summary, action: nil, keyEquivalent: "")
+
+        let submenu = NSMenu()
+        submenu.delegate = self
+
+        let auto = NSMenuItem(title: "Auto",
+                              action: #selector(applyFanAction(_:)),
+                              keyEquivalent: "")
+        auto.target = self
+        auto.representedObject = FanAction(scope: .all, value: nil)
+        auto.state = allAuto ? .on : .off
+        submenu.addItem(auto)
+
+        submenu.addItem(NSMenuItem.separator())
+
+        for pct in [0, 25, 50, 75, 100] {
+            let label: String = {
+                switch pct {
+                case 0:   return "Min"
+                case 100: return "Max"
+                default:  return "\(pct)%"
+                }
+            }()
+            let padded = label.padding(toLength: 5, withPad: " ", startingAt: 0)
+            let title = String(format: "%@  %d%%", padded, pct)
+            let itm = NSMenuItem(title: title,
+                                 action: #selector(applyFanAction(_:)),
+                                 keyEquivalent: "")
+            itm.target = self
+            itm.representedObject = FanAction(scope: .all, value: Double(pct))
+            submenu.addItem(itm)
+        }
+        item.submenu = submenu
+        return item
+    }
+
+    /// A temperature group: the parent row shows the group name, sensor
+    /// count, and average; the submenu lists every individual sensor.
+    private func temperatureGroupItem(group: SensorGroup, readings: [ThermalReading]) -> NSMenuItem {
+        let avg = readings.map { $0.celsius }.reduce(0, +) / Double(readings.count)
+        let title = String(format: "%@ — %.1f°C avg (%d sensor%@)",
+                           group.rawValue, avg, readings.count, readings.count == 1 ? "" : "s")
+        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        let submenu = NSMenu()
+        submenu.delegate = self
+        for r in readings {
+            submenu.addItem(disabled(String(format: "%@  %.1f°C", r.name, r.celsius)))
+        }
+        item.submenu = submenu
+        return item
     }
 
     private func fanMenuItem(for f: FanReading) -> NSMenuItem {
@@ -210,7 +276,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                               action: #selector(applyFanAction(_:)),
                               keyEquivalent: "")
         auto.target = self
-        auto.representedObject = FanAction(fanIndex: f.index, targetRPM: nil)
+        auto.representedObject = FanAction(scope: .one(f.index), value: nil)
         auto.state = (f.mode == 0) ? .on : .off
         submenu.addItem(auto)
 
@@ -232,7 +298,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                       action: #selector(applyFanAction(_:)),
                                       keyEquivalent: "")
                 item.target = self
-                item.representedObject = FanAction(fanIndex: f.index, targetRPM: rpm)
+                item.representedObject = FanAction(scope: .one(f.index), value: rpm)
                 submenu.addItem(item)
             }
         } else if let mn = f.minRPM, let mx = f.maxRPM {
@@ -248,10 +314,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func applyFanAction(_ sender: NSMenuItem) {
         guard let action = sender.representedObject as? FanAction else { return }
         let ok: Bool
-        if let rpm = action.targetRPM {
-            ok = Fans.setTarget(action.fanIndex, rpm: rpm)
-        } else {
-            ok = Fans.setAuto(action.fanIndex)
+        switch action.scope {
+        case .one(let idx):
+            if let rpm = action.value {
+                ok = Fans.setTarget(idx, rpm: rpm)
+            } else {
+                ok = Fans.setAuto(idx)
+            }
+        case .all:
+            if let pct = action.value {
+                ok = Fans.setAllTargets(pct: pct)
+            } else {
+                Fans.restoreAllToAuto()
+                ok = true
+            }
         }
         if !ok {
             notifyWriteRejected()
@@ -259,13 +335,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // SMC propagation delay: the key readback right after a write often
         // still shows the pre-write value. Wait a beat so the next menu open
         // reflects the just-applied mode/target.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
-            self?.refresh()
-        }
-    }
-
-    @objc private func restoreAllAuto(_ sender: NSMenuItem) {
-        Fans.restoreAllToAuto()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
             self?.refresh()
         }
