@@ -33,7 +33,7 @@ final class HelperListenerDelegate: NSObject, NSXPCListenerDelegate {
 // Items, system shutdown, etc.). Restore all fans to auto first so we don't
 // leave the hardware in forced mode when the helper disappears.
 
-func installSignalHandlers() {
+func installSignalHandlers(controller: FanController) {
     signal(SIGTERM, SIG_IGN)
     signal(SIGINT, SIG_IGN)
 
@@ -41,8 +41,11 @@ func installSignalHandlers() {
         // sync on SMC.queue so any in-flight XPC-driven SMC transaction
         // finishes before we restore-to-auto and exit. This matters: the
         // signal handler would otherwise race concurrent setFanTarget
-        // calls hitting the same `AppleSMC` userclient.
+        // calls hitting the same `AppleSMC` userclient. The controller
+        // timer also runs on SMC.queue — disabling here serializes with
+        // any in-flight tick.
         SMC.queue.sync {
+            controller.disable(reason: "received termination signal")
             Fans.restoreAllToAuto()
         }
         exit(0)
@@ -66,9 +69,17 @@ var signalSources: [DispatchSourceSignal] = []
 let version = "0.1.0"
 os_log("ChillPillHelper starting (version %{public}@)", log: log, type: .info, version)
 
-installSignalHandlers()
+let controller = FanController()
+installSignalHandlers(controller: controller)
 
-let impl = HelperImpl(version: version)
+// Resume the controller from persisted config if the user had opted in.
+// Must run on SMC.queue — the controller's mutable state contract requires
+// it. `sync` so startup finishes before XPC connections can race the state.
+SMC.queue.sync {
+    controller.resumeIfConfiguredOnStartup()
+}
+
+let impl = HelperImpl(version: version, controller: controller)
 let delegate = HelperListenerDelegate(impl: impl)
 let listener = NSXPCListener(machServiceName: ChillPillHelperMachServiceName)
 listener.delegate = delegate
