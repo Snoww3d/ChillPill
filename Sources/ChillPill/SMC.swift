@@ -53,6 +53,36 @@ final class SMC {
         read(key).flatMap { Self.decode($0) }
     }
 
+    /// Write raw bytes to a key. Byte count must match the key's advertised
+    /// `dataSize`. Returns false on any failure (missing key, wrong size,
+    /// userclient rejected the call — typically because the process is not
+    /// root).
+    @discardableResult
+    func write(_ key: String, bytes: [UInt8]) -> Bool {
+        guard ensureOpen() else { return false }
+        guard let info = getKeyInfo(key) else { return false }
+        guard bytes.count == Int(info.dataSize) else { return false }
+        let input = buildInput(
+            key: key,
+            selector: Self.kSMCWriteKey,
+            dataSize: info.dataSize,
+            payload: bytes
+        )
+        return call(input) != nil
+    }
+
+    /// Encode a 32-bit float for an SMC `flt ` key. On Apple Silicon the
+    /// SMC stores these little-endian (same as the host).
+    static func encodeFLT(_ value: Float) -> [UInt8] {
+        let bits = value.bitPattern
+        return [
+            UInt8( bits        & 0xff),
+            UInt8((bits >> 8)  & 0xff),
+            UInt8((bits >> 16) & 0xff),
+            UInt8((bits >> 24) & 0xff),
+        ]
+    }
+
     // MARK: - Decoding
 
     static func decode(_ v: Value) -> Double? {
@@ -116,6 +146,7 @@ final class SMC {
 
     private static let kSMCHandleYPCEvent: UInt32 = 2
     private static let kSMCReadKey: UInt8 = 5
+    private static let kSMCWriteKey: UInt8 = 6
     private static let kSMCGetKeyInfo: UInt8 = 9
 
     /// SMCParamStruct is 80 bytes. Relevant offsets:
