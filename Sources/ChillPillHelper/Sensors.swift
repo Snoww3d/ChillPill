@@ -120,10 +120,22 @@ enum Sensors {
         if n.contains("gpu") {
             return .gpu
         }
-        if n.contains("cpu") || n.contains("pecpu") || n.contains("ecpu")
-            || n.contains("pcpu") || n.contains("pmp") || n.contains("soc")
-            || n.contains("efuse")
-            || n.contains("pacc") || n.contains("eacc") {
+        // M-series cluster sensors first — order matters: "pACC" must match
+        // before the generic "cpu" test, and "pecpu" contains "ecpu" so
+        // check that distinct pair before the looser keyword set.
+        if n.contains("pacc") || n.contains("pcpu") {
+            return .pcore
+        }
+        if n.contains("eacc") || n.contains("ecpu") || n.contains("pecpu") {
+            return .ecore
+        }
+        // SoC-wide sensors: PMGR die, SOC fabric, efuse, PMP die.
+        if n.contains("soc") || n.contains("pmgr") || n.contains("pmp")
+            || n.contains("efuse") {
+            return .soc
+        }
+        // Catch-all CPU: Intel-era / miscellaneous core-adjacent sensors.
+        if n.contains("cpu") {
             return .cpu
         }
         if n.contains("dram") || n.contains("memory") || n.contains("mem ") {
@@ -137,12 +149,20 @@ enum Sensors {
         let chars = Array(key)
         switch chars[1] {
         case "B", "b":        return .battery
-        case "C", "p", "P":   return .cpu
-        case "e":             return .cpu
+        // `Tp*` on Apple Silicon = P-core cluster readings; on Intel it's
+        // historically CPU package. `.pcore` is the better default — Intel
+        // users will see it in P-Cores which is still correct.
+        case "p":             return .pcore
+        case "e":             return .ecore
+        // `TC*` is generic CPU (package / proximity / uncore) and `TN*` is
+        // MCP / north-bridge — both better live in SoC on M-series, with
+        // .cpu as an Intel-era fallback. We default to .cpu because a plain
+        // TC0P on Intel is definitely CPU proximity, not SoC.
+        case "C", "P":        return .cpu
+        case "N":             return .soc
         case "G", "g":        return .gpu
         case "H", "h":        return .storage
         case "M", "m":        return .memory
-        case "N":             return .cpu
         case "A", "a":        return .ambient
         case "s":             return .ambient
         case "W", "w":        return .other

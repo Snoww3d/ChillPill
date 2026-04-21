@@ -5,8 +5,15 @@ import Foundation
 public let ChillPillHelperMachServiceName = "dev.chillpill.helper"
 
 /// High-level category a thermal sensor belongs to, used to group the menu
-/// dropdown. Order here defines the display order.
+/// dropdown. Order here defines the display order — the menu reads top-down
+/// from "hottest under CPU load" to "slowest-moving".
 public enum SensorGroup: String, Codable, CaseIterable, Sendable {
+    case pcore   = "P-Cores"
+    case ecore   = "E-Cores"
+    case soc     = "SoC"
+    /// Fallback for Intel / non-M-series CPU sensors and anything CPU-adjacent
+    /// that doesn't fit the P-core / E-core / SoC split (e.g. generic SMC
+    /// `TC*` keys). On a typical M-series Mac this group will be empty.
     case cpu     = "CPU"
     case gpu     = "GPU"
     case memory  = "Memory"
