@@ -223,9 +223,12 @@ enum Sensors {
         default: break
         }
 
-        if key.hasPrefix("Tp") || key.hasPrefix("Te") || key.hasPrefix("Tg") {
-            return nil
-        }
+        // Note: we used to suppress `Tp*`/`Te*`/`Tg*` here to avoid visible
+        // overlap with HID `pACC`/`eACC`/`GPU MTR` names. But on Macs where
+        // HID doesn't surface those per-cluster labels, suppressing left the
+        // P-Cores / E-Cores groups empty. Let SMC names flow through — the
+        // `displayName` dedup in `readThermal()` still collapses true dupes,
+        // and `"SMC Tp01"` (default SMC name) doesn't collide with `"P-Core 1"`.
 
         switch key {
         case "TC0P": return "CPU Proximity"
