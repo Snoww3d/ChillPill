@@ -13,9 +13,30 @@ final class FanAction: NSObject {
     }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private var timer: Timer?
+
+    /// Strong refs keep the DispatchSourceSignal alive beyond
+    /// applicationDidFinishLaunching.
+    private var sigtermSource: DispatchSourceSignal?
+    private var sigintSource: DispatchSourceSignal?
+
+    /// Count of currently-open menus (root + any submenu). Non-zero means
+    /// something is tracking and we should skip menu rebuilds. A plain Bool
+    /// wouldn't work: NSMenuDelegate fires on each menu, so walking between
+    /// submenus emits didClose+willOpen pairs that would flip a bool to false
+    /// while the root is still open.
+    private var menuOpenCount = 0
+
+    /// When non-nil and in the future, the status-bar title update in refresh()
+    /// is skipped so a transient toast stays visible.
+    private var suppressTitleUpdateUntil: Date?
+
+    /// Set once a fatal-signal handler has started running, so a second
+    /// signal (or a hypothetical refactor that removes the main-queue
+    /// serialization) can't re-enter the shutdown path.
+    private var fatalSignalFired = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -26,14 +47,65 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             button.title = " --°"
         }
 
+        installSignalHandlers()
         refresh()
-        timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+
+        // Schedule on .common so the timer keeps firing while the menu is
+        // open (and therefore in .eventTracking mode). We separately skip
+        // the *menu* rebuild during tracking — only the status-bar title
+        // updates live.
+        let t = Timer(timeInterval: 2.0, repeats: true) { [weak self] _ in
             self?.refresh()
         }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         Fans.restoreAllToAuto()
+    }
+
+    // MARK: - Signal handling
+    //
+    // AppKit only invokes applicationWillTerminate for graceful shutdowns
+    // (Quit menu, NSApp.terminate, logout). A plain `kill` / `pkill` / Ctrl-C
+    // on `sudo swift run` sends SIGTERM or SIGINT, which would normally
+    // bypass AppKit's terminate path entirely — leaving the fans stuck at
+    // whatever forced target was last applied. We catch those signals with
+    // DispatchSource and restore auto before exiting.
+
+    private func installSignalHandlers() {
+        // Ignore the default disposition so libdispatch's signal sources
+        // actually receive the signal.
+        signal(SIGTERM, SIG_IGN)
+        signal(SIGINT, SIG_IGN)
+
+        let term = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+        term.setEventHandler { [weak self] in self?.handleFatalSignal() }
+        term.resume()
+        sigtermSource = term
+
+        let sigint = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+        sigint.setEventHandler { [weak self] in self?.handleFatalSignal() }
+        sigint.resume()
+        sigintSource = sigint
+    }
+
+    private func handleFatalSignal() {
+        guard !fatalSignalFired else { return }
+        fatalSignalFired = true
+        Fans.restoreAllToAuto()
+        exit(0)
+    }
+
+    // MARK: - NSMenuDelegate
+
+    func menuWillOpen(_ menu: NSMenu) {
+        menuOpenCount += 1
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        menuOpenCount = max(0, menuOpenCount - 1)
     }
 
     // MARK: - Menu build
@@ -41,13 +113,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func refresh() {
         let readings = Sensors.readThermal()
         let hottest = Sensors.hottestCPU(readings)
-        let fans = Fans.readAll()
-
-        if let button = statusItem.button, let h = hottest {
-            button.title = String(format: " %.0f°", h.celsius)
+        let now = Date()
+        if let deadline = suppressTitleUpdateUntil, now < deadline {
+            // Toast still showing; leave the title alone.
+        } else {
+            suppressTitleUpdateUntil = nil
+            if let button = statusItem.button, let h = hottest {
+                button.title = String(format: " %.0f°", h.celsius)
+            }
         }
 
+        if menuOpenCount > 0 { return }
+
+        let fans = Fans.readAll()
         let menu = NSMenu()
+        menu.delegate = self
 
         menu.addItem(sectionHeader("Fans"))
         if fans.isEmpty {
@@ -83,14 +163,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func fanMenuItem(for f: FanReading) -> NSMenuItem {
-        let modeLabel: String = {
-            switch f.mode {
-            case 0: return "auto"
-            case 1: return "forced"
-            case .some(let m): return "mode \(m)"
-            case .none: return "?"
-            }
-        }()
+        let modeLabel = modeLabelFor(f)
         let rangeStr: String = {
             if let mn = f.minRPM, let mx = f.maxRPM {
                 return String(format: " [%.0f–%.0f]", mn, mx)
@@ -102,8 +175,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             f.index, f.actualRPM, rangeStr, modeLabel
         )
         let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
-        item.submenu = buildFanSubmenu(for: f)
+        let submenu = buildFanSubmenu(for: f)
+        submenu.delegate = self
+        item.submenu = submenu
         return item
+    }
+
+    private func modeLabelFor(_ f: FanReading) -> String {
+        switch f.mode {
+        case 0:
+            return "auto"
+        case 1:
+            guard let t = f.targetRPM, let mn = f.minRPM, let mx = f.maxRPM else {
+                return "forced"
+            }
+            if mx > mn {
+                let pct = (t - mn) / (mx - mn) * 100.0
+                return String(format: "%.0f%%", pct)
+            }
+            // Advertised range is degenerate — show both so the weirdness
+            // isn't hidden.
+            return String(format: "forced (range %.0f/%.0f)", mn, mx)
+        case .some(let m):
+            return "mode \(m)"
+        case .none:
+            return "?"
+        }
     }
 
     private func buildFanSubmenu(for f: FanReading) -> NSMenu {
@@ -129,7 +226,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     default:  return "\(pct)%"
                     }
                 }()
-                let title = String(format: "%-5s  %.0f RPM", (label as NSString).utf8String ?? "", rpm)
+                let padded = label.padding(toLength: 5, withPad: " ", startingAt: 0)
+                let title = String(format: "%@  %.0f RPM", padded, rpm)
                 let item = NSMenuItem(title: title,
                                       action: #selector(applyFanAction(_:)),
                                       keyEquivalent: "")
@@ -137,6 +235,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 item.representedObject = FanAction(fanIndex: f.index, targetRPM: rpm)
                 submenu.addItem(item)
             }
+        } else if let mn = f.minRPM, let mx = f.maxRPM {
+            submenu.addItem(disabled(String(format: "  Min/Max invalid: %.0f/%.0f", mn, mx)))
         } else {
             submenu.addItem(disabled("  Min/Max not reported"))
         }
@@ -156,22 +256,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if !ok {
             notifyWriteRejected()
         }
-        refresh()
+        // SMC propagation delay: the key readback right after a write often
+        // still shows the pre-write value. Wait a beat so the next menu open
+        // reflects the just-applied mode/target.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            self?.refresh()
+        }
     }
 
     @objc private func restoreAllAuto(_ sender: NSMenuItem) {
         Fans.restoreAllToAuto()
-        refresh()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            self?.refresh()
+        }
     }
 
     private func notifyWriteRejected() {
         guard let button = statusItem.button else { return }
-        let original = button.title
         button.title = " ⚠︎ need sudo"
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-            if let b = self?.statusItem.button, b.title == " ⚠︎ need sudo" {
-                b.title = original
-            }
+        let expiry: TimeInterval = 2.0
+        suppressTitleUpdateUntil = Date().addingTimeInterval(expiry)
+        // Schedule an explicit refresh once the toast window ends so the title
+        // returns to the temperature promptly, instead of lingering until the
+        // next 2-second timer tick happens to align.
+        DispatchQueue.main.asyncAfter(deadline: .now() + expiry + 0.05) { [weak self] in
+            self?.refresh()
         }
     }
 

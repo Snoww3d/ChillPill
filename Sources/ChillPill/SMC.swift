@@ -1,5 +1,6 @@
 import Foundation
 import IOKit
+import os.log
 
 /// Userspace client for the `AppleSMC` service.
 ///
@@ -12,15 +13,25 @@ import IOKit
 ///   - `kSMCReadKey     = 5` — returns up to 32 bytes of value data
 ///   - `kSMCWriteKey    = 6` — writes up to 32 bytes (root-only on AS)
 ///
-/// SMC byte-order is largely big-endian, with one Apple Silicon twist:
-/// `flt ` values (used for fan RPM on M-series) are little-endian. Signed
-/// fixed-point (`sp78`) and unsigned fixed-point (`fp*`, `ui*`) keys remain
-/// big-endian.
+/// Endianness:
+///   - The `UInt32 key` field and `keyInfo.dataType` (also UInt32) are written
+///     and read as *native* UInt32s by the kernel. On a little-endian host
+///     that means the 4 ascii chars of a FourCC appear *reversed* in the
+///     80-byte buffer — which is why we write with `writeLE32(fourCC)` rather
+///     than copying the utf8 bytes in order, and why decoding `dataType`
+///     reads `readLE32` then extracts bytes big-end first.
+///   - Payload bytes in `buf[48..]` are key-type specific. `flt ` is little-
+///     endian IEEE754 on Apple Silicon; `sp78`, `fp*`, and `ui*` are big-
+///     endian. The `decode(_:)` and `encodeFLT(_:)` helpers encapsulate this.
 final class SMC {
 
     // MARK: - Public API
 
     static let shared = SMC()
+
+    /// Max bytes any SMC key can carry — matches the `bytes[32]` field in the
+    /// 80-byte SMCParamStruct. Reads/writes exceeding this are rejected.
+    static let maxPayloadSize = 32
 
     enum SMCError: Error {
         case serviceNotFound
@@ -44,6 +55,13 @@ final class SMC {
     func read(_ key: String) -> Value? {
         guard ensureOpen() else { return nil }
         guard let info = getKeyInfo(key) else { return nil }
+        guard info.dataSize <= UInt32(Self.maxPayloadSize) else {
+            os_log(
+                "SMC: refusing read of %{public}@ — kernel claims dataSize=%u > %d",
+                log: Self.log, type: .error, key, info.dataSize, Self.maxPayloadSize
+            )
+            return nil
+        }
         guard let bytes = readBytes(key, size: info.dataSize) else { return nil }
         return Value(key: key, info: info, bytes: bytes)
     }
@@ -60,14 +78,16 @@ final class SMC {
     @discardableResult
     func write(_ key: String, bytes: [UInt8]) -> Bool {
         guard ensureOpen() else { return false }
+        guard bytes.count <= Self.maxPayloadSize else { return false }
         guard let info = getKeyInfo(key) else { return false }
+        guard info.dataSize <= UInt32(Self.maxPayloadSize) else { return false }
         guard bytes.count == Int(info.dataSize) else { return false }
-        let input = buildInput(
+        guard let input = buildInput(
             key: key,
             selector: Self.kSMCWriteKey,
             dataSize: info.dataSize,
             payload: bytes
-        )
+        ) else { return false }
         return call(input) != nil
     }
 
@@ -114,11 +134,17 @@ final class SMC {
             let raw = UInt16(b[0]) << 8 | UInt16(b[1])
             return Double(raw) / 32768.0
         default:
+            os_log(
+                "SMC: unhandled dataType %{public}@ for key %{public}@",
+                log: Self.log, type: .debug, v.info.dataType, v.key
+            )
             return nil
         }
     }
 
     // MARK: - Lifecycle
+
+    private static let log = OSLog(subsystem: "dev.chillpill", category: "SMC")
 
     private var connection: io_connect_t = 0
     private var isOpen = false
@@ -150,10 +176,9 @@ final class SMC {
     private static let kSMCGetKeyInfo: UInt8 = 9
 
     /// SMCParamStruct is 80 bytes. Relevant offsets:
-    ///   0   UInt32 key           (4-char code, natural byte order on LE host
-    ///                             matches SMC's expected byte sequence)
+    ///   0   UInt32 key           (native order; on LE the FourCC appears reversed)
     ///   28  UInt32 keyInfo.dataSize
-    ///   32  UInt32 keyInfo.dataType (FourCC)
+    ///   32  UInt32 keyInfo.dataType (FourCC, also native order)
     ///   40  UInt8  result         (0 = success, 0x84 = key not found, …)
     ///   41  UInt8  status
     ///   42  UInt8  data8          (sub-selector)
@@ -161,17 +186,15 @@ final class SMC {
     ///   48  UInt8  bytes[32]
     private static let paramStructSize = 80
 
-    private func buildInput(key: String, selector: UInt8, dataSize: UInt32 = 0, payload: [UInt8] = []) -> [UInt8] {
+    private func buildInput(key: String, selector: UInt8, dataSize: UInt32 = 0, payload: [UInt8] = []) -> [UInt8]? {
+        guard payload.count <= Self.maxPayloadSize else { return nil }
+        guard let fourcc = fourCC(key) else { return nil }
         var buf = [UInt8](repeating: 0, count: Self.paramStructSize)
-        // The kernel stores `UInt32 key` in native byte order. On little-endian
-        // machines the FourCC 'F0Ac' = 0x46304163 ends up in memory as
-        // 63 41 30 46. Compute the natural-order UInt32 and write it little-
-        // endian so the kernel reads the expected value on the other side.
-        writeLE32(&buf, at: 0, fourCC(key))
+        writeLE32(&buf, at: 0, fourcc)
         writeLE32(&buf, at: 28, dataSize)
         buf[42] = selector
-        for (i, byte) in payload.prefix(32).enumerated() {
-            buf[48 + i] = byte
+        if !payload.isEmpty {
+            buf.replaceSubrange(48..<(48 + payload.count), with: payload)
         }
         return buf
     }
@@ -190,16 +213,18 @@ final class SMC {
             }
         }
         guard kr == kIOReturnSuccess else { return nil }
+        // A truncated response would leave `output[40]` as the zero we
+        // initialized — which would be misread as SMC success. Require the
+        // full param struct came back.
+        guard outSize == Self.paramStructSize else { return nil }
         guard output[40] == 0 else { return nil }
         return output
     }
 
     private func getKeyInfo(_ key: String) -> KeyInfo? {
-        let input = buildInput(key: key, selector: Self.kSMCGetKeyInfo)
+        guard let input = buildInput(key: key, selector: Self.kSMCGetKeyInfo) else { return nil }
         guard let output = call(input) else { return nil }
         let dataSize = readLE32(output, at: 28)
-        // dataType is the same story as the key: native UInt32 on LE memory,
-        // so the ascii chars appear reversed in the byte stream.
         let typeU32 = readLE32(output, at: 32)
         let typeBytes: [UInt8] = [
             UInt8((typeU32 >> 24) & 0xff),
@@ -212,17 +237,25 @@ final class SMC {
     }
 
     private func readBytes(_ key: String, size: UInt32) -> [UInt8]? {
-        let input = buildInput(key: key, selector: Self.kSMCReadKey, dataSize: size)
+        guard size <= UInt32(Self.maxPayloadSize) else { return nil }
+        guard let input = buildInput(key: key, selector: Self.kSMCReadKey, dataSize: size) else {
+            return nil
+        }
         guard let output = call(input) else { return nil }
-        let count = min(Int(size), 32)
+        let count = Int(size)
         return Array(output[48..<(48 + count)])
     }
 
     // MARK: - Helpers
 
-    private func fourCC(_ key: String) -> UInt32 {
+    /// FourCC packing. Requires exactly 4 ASCII (0x20–0x7e) characters. nil on
+    /// anything else so callers don't silently send garbage keys.
+    private func fourCC(_ key: String) -> UInt32? {
+        let bytes = Array(key.utf8)
+        guard bytes.count == 4 else { return nil }
         var v: UInt32 = 0
-        for c in key.utf8.prefix(4) {
+        for c in bytes {
+            guard c >= 0x20 && c <= 0x7e else { return nil }
             v = (v << 8) | UInt32(c)
         }
         return v
