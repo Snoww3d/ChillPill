@@ -29,6 +29,13 @@ final class FanActionBox: NSObject {
     init(_ action: FanAction) { self.action = action }
 }
 
+/// Same reason as `FanActionBox` — `SensorSelector` is a value type and
+/// NSMenuItem.representedObject needs an `AnyObject`.
+final class SensorSelectorBox: NSObject {
+    let selector: SensorSelector
+    init(_ selector: SensorSelector) { self.selector = selector }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let log = OSLog(subsystem: "dev.chillpill", category: "App")
 
@@ -51,6 +58,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private var latestFans: [FanDTO] = []
     private var latestTemps: [TemperatureDTO] = []
+    private var latestControlState: ControlStateDTO?
 
     /// CPU-family sensor groups that nest under a single "CPU" parent in
     /// the menu. `.cpu` is the Intel-era / miscellaneous fallback; under
@@ -308,6 +316,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.latestTemps = temps
             self?.rebuildMenu()
         }
+        refreshControllerOnly()
+    }
+
+    /// Narrow refresh for controller-only mutations (setpoint / sensor /
+    /// preset / resume-on-launch). Avoids re-fetching fans + temps when
+    /// only the controller state actually changed.
+    private func refreshControllerOnly() {
+        HelperClient.shared.getControlState { [weak self] state in
+            self?.latestControlState = state
+            self?.rebuildMenu()
+        }
     }
 
     private func rebuildMenu() {
@@ -338,6 +357,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 menu.addItem(fanMenuItem(for: f))
             }
         }
+
+        menu.addItem(NSMenuItem.separator())
+
+        menu.addItem(sectionHeader("Control"))
+        appendControllerItems(to: menu)
 
         menu.addItem(NSMenuItem.separator())
 
@@ -412,9 +436,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let rpms = fans.map { $0.actualRPM }
         let avgRPM = rpms.isEmpty ? 0 : rpms.reduce(0, +) / Double(rpms.count)
         let allAuto = fans.allSatisfy { $0.mode == 0 }
-        let summary = allAuto
-            ? String(format: "All fans: %.0f RPM avg — auto", avgRPM)
-            : String(format: "All fans: %.0f RPM avg", avgRPM)
+        let summary: String
+        if latestControlState?.enabled == true {
+            if let output = latestControlState?.lastOutputPercent {
+                summary = String(format: "All fans: %.0f RPM avg — controller %.0f%%", avgRPM, output)
+            } else {
+                summary = String(format: "All fans: %.0f RPM avg — controller", avgRPM)
+            }
+        } else if allAuto {
+            summary = String(format: "All fans: %.0f RPM avg — auto", avgRPM)
+        } else {
+            summary = String(format: "All fans: %.0f RPM avg", avgRPM)
+        }
         let item = NSMenuItem(title: summary, action: nil, keyEquivalent: "")
 
         let submenu = NSMenu()
@@ -490,6 +523,244 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return item
     }
 
+    // MARK: - Controller menu items
+
+    /// Preset setpoint choices for the "Target temperature" submenu. Kept
+    /// short — the `Custom…` entry covers everything else.
+    private static let setpointPresets: [Double] = [65, 72, 75, 80, 85]
+
+    /// Sensor-selector choices for the picker submenu. Order matters; the
+    /// first entry in each pair is the default group for that role.
+    private static let sensorChoices: [(label: String, selector: SensorSelector)] = [
+        ("P-Cores (max)", .groupMax(.pcore)),
+        ("E-Cores (max)", .groupMax(.ecore)),
+        ("SoC (max)",     .groupMax(.soc)),
+        ("CPU fallback (max)", .groupMax(.cpu)),
+        ("P-Cores (avg)", .groupAvg(.pcore)),
+        ("E-Cores (avg)", .groupAvg(.ecore)),
+        ("SoC (avg)",     .groupAvg(.soc)),
+        ("CPU fallback (avg)", .groupAvg(.cpu))
+    ]
+
+    private func appendControllerItems(to menu: NSMenu) {
+        guard let state = latestControlState else {
+            menu.addItem(disabled("  Controller: connecting…"))
+            return
+        }
+
+        // Status line — mode + live reading when enabled.
+        let statusLine: String
+        if state.enabled {
+            if let reading = state.currentReadingCelsius,
+               let error = state.currentErrorCelsius,
+               let output = state.lastOutputPercent {
+                statusLine = String(format: "  Active — %.1f°C / err %+.1f°C / out %.0f%%",
+                                    reading, error, output)
+            } else {
+                statusLine = "  Active — waiting for first tick…"
+            }
+        } else if let reason = state.fallbackReason {
+            statusLine = "  ⚠︎ Disabled — \(reason)"
+        } else {
+            statusLine = "  Disabled"
+        }
+        menu.addItem(disabled(statusLine))
+
+        // Target temperature: always shown, even when disabled (so the user
+        // can see / change the setpoint before flipping enable on).
+        menu.addItem(disabled(String(format: "  Target: %.0f°C — Sensor: %@ — Preset: %@",
+                                      state.setpointCelsius,
+                                      shortLabel(for: state.sensor),
+                                      state.preset.rawValue.capitalized)))
+
+        // Enable / disable toggle.
+        let toggle = NSMenuItem(
+            title: state.enabled ? "Disable Controller" : "Enable Controller",
+            action: #selector(toggleController(_:)),
+            keyEquivalent: "")
+        toggle.target = self
+        menu.addItem(toggle)
+
+        // Target temperature submenu.
+        menu.addItem(setpointSubmenu(state: state))
+        // Sensor submenu.
+        menu.addItem(sensorSubmenu(state: state))
+        // Preset submenu.
+        menu.addItem(presetSubmenu(state: state))
+
+        // Resume-on-reboot checkbox.
+        let resume = NSMenuItem(title: "Resume on Reboot",
+                                action: #selector(toggleResumeOnLaunch(_:)),
+                                keyEquivalent: "")
+        resume.target = self
+        resume.state = state.resumeOnLaunch ? .on : .off
+        menu.addItem(resume)
+    }
+
+    private func shortLabel(for sensor: SensorSelector) -> String {
+        switch sensor {
+        case .groupMax(let g): return "\(g.rawValue) max"
+        case .groupAvg(let g): return "\(g.rawValue) avg"
+        }
+    }
+
+    private func setpointSubmenu(state: ControlStateDTO) -> NSMenuItem {
+        let parent = NSMenuItem(title: "Target Temperature",
+                                action: nil, keyEquivalent: "")
+        let submenu = NSMenu()
+        submenu.delegate = self
+        for preset in Self.setpointPresets {
+            let item = NSMenuItem(
+                title: String(format: "%.0f°C", preset),
+                action: #selector(applySetpoint(_:)),
+                keyEquivalent: "")
+            item.target = self
+            item.representedObject = NSNumber(value: preset)
+            item.state = (abs(state.setpointCelsius - preset) < 0.1) ? .on : .off
+            submenu.addItem(item)
+        }
+        submenu.addItem(NSMenuItem.separator())
+        let custom = NSMenuItem(title: "Custom…",
+                                action: #selector(promptCustomSetpoint(_:)),
+                                keyEquivalent: "")
+        custom.target = self
+        submenu.addItem(custom)
+        parent.submenu = submenu
+        return parent
+    }
+
+    private func sensorSubmenu(state: ControlStateDTO) -> NSMenuItem {
+        let parent = NSMenuItem(title: "Sensor", action: nil, keyEquivalent: "")
+        let submenu = NSMenu()
+        submenu.delegate = self
+        var lastWasMax: Bool? = nil
+        for (i, choice) in Self.sensorChoices.enumerated() {
+            let isMax: Bool = {
+                if case .groupMax = choice.selector { return true } else { return false }
+            }()
+            if let prev = lastWasMax, prev != isMax, i > 0 {
+                submenu.addItem(NSMenuItem.separator())
+            }
+            lastWasMax = isMax
+            let item = NSMenuItem(title: choice.label,
+                                  action: #selector(applySensor(_:)),
+                                  keyEquivalent: "")
+            item.target = self
+            item.representedObject = SensorSelectorBox(choice.selector)
+            item.state = (choice.selector == state.sensor) ? .on : .off
+            submenu.addItem(item)
+        }
+        parent.submenu = submenu
+        return parent
+    }
+
+    private func presetSubmenu(state: ControlStateDTO) -> NSMenuItem {
+        let parent = NSMenuItem(title: "Preset", action: nil, keyEquivalent: "")
+        let submenu = NSMenu()
+        submenu.delegate = self
+        for preset in ControlPreset.allCases {
+            let item = NSMenuItem(title: preset.rawValue.capitalized,
+                                  action: #selector(applyPreset(_:)),
+                                  keyEquivalent: "")
+            item.target = self
+            item.representedObject = preset.rawValue as NSString
+            item.state = (preset == state.preset) ? .on : .off
+            submenu.addItem(item)
+        }
+        parent.submenu = submenu
+        return parent
+    }
+
+    // MARK: - Controller actions
+
+    @objc private func toggleController(_ sender: NSMenuItem) {
+        let newEnabled = !(latestControlState?.enabled ?? false)
+        HelperClient.shared.setControlEnabled(newEnabled) { [weak self] err in
+            if let err = err {
+                self?.notifyWriteRejected(reason: err.localizedDescription)
+            }
+            self?.refresh()
+        }
+    }
+
+    @objc private func toggleResumeOnLaunch(_ sender: NSMenuItem) {
+        let newFlag = !(latestControlState?.resumeOnLaunch ?? false)
+        HelperClient.shared.setControlResumeOnLaunch(newFlag) { [weak self] err in
+            if let err = err {
+                self?.notifyWriteRejected(reason: err.localizedDescription)
+            }
+            self?.refreshControllerOnly()
+        }
+    }
+
+    @objc private func applySetpoint(_ sender: NSMenuItem) {
+        guard let n = sender.representedObject as? NSNumber else { return }
+        HelperClient.shared.setControlSetpoint(n.doubleValue) { [weak self] err in
+            if let err = err {
+                self?.notifyWriteRejected(reason: err.localizedDescription)
+            }
+            self?.refreshControllerOnly()
+        }
+    }
+
+    @objc private func promptCustomSetpoint(_ sender: NSMenuItem) {
+        let alert = NSAlert()
+        alert.messageText = "Set target temperature"
+        alert.informativeText = "Enter a value between 20 and 110 °C."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 100, height: 24))
+        if let current = latestControlState?.setpointCelsius {
+            field.stringValue = String(format: "%.0f", current)
+        } else {
+            field.placeholderString = "75"
+        }
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Set")
+        alert.addButton(withTitle: "Cancel")
+        // Without this, the text field doesn't take first-responder on some
+        // macOS versions and the user has to click before typing.
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        guard let value = Double(field.stringValue), value >= 20, value <= 110 else {
+            notifyWriteRejected(reason: "setpoint must be 20–110 °C")
+            return
+        }
+        HelperClient.shared.setControlSetpoint(value) { [weak self] err in
+            if let err = err {
+                self?.notifyWriteRejected(reason: err.localizedDescription)
+            }
+            self?.refreshControllerOnly()
+        }
+    }
+
+    @objc private func applySensor(_ sender: NSMenuItem) {
+        guard let box = sender.representedObject as? SensorSelectorBox else { return }
+        HelperClient.shared.setControlSensor(box.selector) { [weak self] err in
+            if let err = err {
+                self?.notifyWriteRejected(reason: err.localizedDescription)
+            }
+            self?.refreshControllerOnly()
+        }
+    }
+
+    @objc private func applyPreset(_ sender: NSMenuItem) {
+        // The UI builds these raw values from `ControlPreset.allCases` so a
+        // decode failure here would mean the enum grew a case and the UI
+        // wasn't updated — bail rather than silently sending a surprise
+        // write with some default preset.
+        guard let name = sender.representedObject as? String,
+              let preset = ControlPreset(rawValue: name) else {
+            return
+        }
+        HelperClient.shared.setControlPreset(preset) { [weak self] err in
+            if let err = err {
+                self?.notifyWriteRejected(reason: err.localizedDescription)
+            }
+            self?.refreshControllerOnly()
+        }
+    }
+
+    // MARK: - Fan menu items
+
     private func fanMenuItem(for f: FanDTO) -> NSMenuItem {
         let modeLabel = modeLabelFor(f)
         let rangeStr: String = {
@@ -510,6 +781,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func modeLabelFor(_ f: FanDTO) -> String {
+        // Controller ownership wins — when the PI loop is driving the fan,
+        // the `mode == 1` + `targetRPM` pair the SMC reports reflects *its*
+        // last write, not a direct user choice. Surfacing "67%" here would
+        // misleadingly imply the user set 67%; show "controller 67%" so the
+        // active owner is clear.
+        if latestControlState?.enabled == true {
+            if let output = latestControlState?.lastOutputPercent {
+                return String(format: "controller %.0f%%", output)
+            }
+            return "controller"
+        }
         switch f.mode {
         case 0:
             return "auto"
