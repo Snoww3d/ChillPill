@@ -1,21 +1,10 @@
 import Foundation
 import os.log
-
-struct FanReading {
-    let index: Int
-    let actualRPM: Double
-    let minRPM: Double?
-    let maxRPM: Double?
-    let targetRPM: Double?
-    /// 0 = auto, 1 = forced (if the key exists on this hardware).
-    let mode: Int?
-}
+import ChillPillShared
 
 enum Fans {
     private static let log = OSLog(subsystem: "dev.chillpill", category: "Fans")
 
-    /// Upper bound on fan count from SMC. Used to guard against a malformed
-    /// FNum read (e.g. a future decoder bug emitting NaN/huge).
     private static let maxFans = 16
 
     static func count() -> Int {
@@ -25,16 +14,16 @@ enum Fans {
         return n
     }
 
-    static func readAll() -> [FanReading] {
+    static func readAll() -> [FanDTO] {
         let n = count()
         guard n > 0 else { return [] }
         return (0..<n).map { read($0) }
     }
 
-    static func read(_ index: Int) -> FanReading {
+    static func read(_ index: Int) -> FanDTO {
         func d(_ key: String) -> Double? { SMC.shared.readDouble(key) }
         let i = index
-        return FanReading(
+        return FanDTO(
             index: i,
             actualRPM: d("F\(i)Ac") ?? 0,
             minRPM:    d("F\(i)Mn"),
@@ -44,8 +33,6 @@ enum Fans {
         )
     }
 
-    /// `Int(Double)` traps on NaN/Inf/out-of-range. Guard at every conversion
-    /// site so a decoder bug in SMC.swift can't crash the app.
     private static func safeInt(_ value: Double?) -> Int? {
         guard let v = value, v.isFinite else { return nil }
         return Int(v)
@@ -53,18 +40,12 @@ enum Fans {
 
     // MARK: - Control
 
-    /// Hand fan control back to the SMC's thermal policy (`F{n}Md = 0`).
     @discardableResult
     static func setAuto(_ index: Int) -> Bool {
         guard isValidIndex(index) else { return false }
         return SMC.shared.write("F\(index)Md", bytes: [0])
     }
 
-    /// Force a specific target RPM. Validates index bounds, rejects
-    /// non-finite values, and clamps `rpm` into the fan's advertised
-    /// `[minRPM, maxRPM]` range before writing. If the target write fails
-    /// *after* the mode flip, we restore auto mode so the fan isn't left in
-    /// forced-mode with a stale target.
     @discardableResult
     static func setTarget(_ index: Int, rpm: Double) -> Bool {
         guard isValidIndex(index) else { return false }
@@ -75,8 +56,6 @@ enum Fans {
         if let mn = reading.minRPM, let mx = reading.maxRPM, mx > mn {
             clamped = min(max(rpm, mn), mx)
         } else {
-            // Without an advertised range we can't safely pick a target at
-            // all — refuse rather than let the caller push an unknown value.
             return false
         }
 
@@ -89,7 +68,7 @@ enum Fans {
             let restored = SMC.shared.write("F\(index)Md", bytes: [0])
             if !restored {
                 os_log(
-                    "Fans: Tg write failed AND restore-to-auto failed for F%d — fan may be stuck in forced mode until next boot or another setAuto attempt",
+                    "Fans: Tg write failed AND restore-to-auto failed for F%d — fan may be stuck in forced mode",
                     log: Self.log, type: .error, index
                 )
             }
@@ -97,19 +76,12 @@ enum Fans {
         return modeOK && targetOK
     }
 
-    /// Best-effort "restore everything to auto" — useful on app shutdown so we
-    /// don't leave the system thermally mismanaged if the user quits without
-    /// clicking Auto first.
     static func restoreAllToAuto() {
         for i in 0..<count() {
             _ = setAuto(i)
         }
     }
 
-    /// Apply the same percentage (0-100) to every fan, scaled against each
-    /// fan's *own* advertised [Min, Max] range. Fans whose range is unknown
-    /// or degenerate are skipped; the return value reflects whether every
-    /// fan accepted its write.
     @discardableResult
     static func setAllTargets(pct: Double) -> Bool {
         guard pct.isFinite else { return false }
@@ -128,8 +100,6 @@ enum Fans {
         }
         return allOK
     }
-
-    // MARK: - Helpers
 
     private static func isValidIndex(_ index: Int) -> Bool {
         index >= 0 && index < count()

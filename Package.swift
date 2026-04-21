@@ -16,9 +16,18 @@ let package = Package(
                 .linkedFramework("CoreFoundation")
             ]
         ),
+        .target(
+            name: "ChillPillShared",
+            path: "Sources/ChillPillShared"
+        ),
+        .executableTarget(
+            name: "ChillPillHelper",
+            dependencies: ["CChillPillIOKit", "ChillPillShared"],
+            path: "Sources/ChillPillHelper"
+        ),
         .executableTarget(
             name: "ChillPill",
-            dependencies: ["CChillPillIOKit"],
+            dependencies: ["ChillPillShared"],
             path: "Sources/ChillPill"
         )
     ]
