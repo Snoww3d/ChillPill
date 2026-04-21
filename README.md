@@ -2,7 +2,7 @@
 
 A macOS menu bar app that shows internal temperatures and (eventually) controls fan speed.
 
-> **Status:** early alpha. Temperature monitoring works on Apple Silicon. Fan control is not wired up yet — see [#TODO](https://github.com/Snoww3d/ChillPill/issues) for the privileged-helper work tracked there.
+> **Status:** early alpha. Temperature monitoring works on Apple Silicon. Fan control is in progress — the shippable privileged-helper architecture is tracked in [#1](https://github.com/Snoww3d/ChillPill/issues/1).
 
 ## Requirements
 

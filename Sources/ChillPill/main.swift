@@ -22,23 +22,78 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func refresh() {
         let readings = Sensors.readThermal()
         let hottest = Sensors.hottestCPU(readings)
+        let fans = Fans.readAll()
 
         if let button = statusItem.button, let h = hottest {
             button.title = String(format: " %.0f°", h.celsius)
         }
 
         let menu = NSMenu()
-        if readings.isEmpty {
-            menu.addItem(NSMenuItem(title: "No sensors found", action: nil, keyEquivalent: ""))
+
+        // Fans section
+        if fans.isEmpty {
+            menu.addItem(sectionHeader("Fans"))
+            menu.addItem(disabled("  No fans reported"))
         } else {
-            for r in readings {
-                let title = String(format: "%-28s %5.1f°C", (r.name as NSString).utf8String ?? "", r.celsius)
-                menu.addItem(NSMenuItem(title: title, action: nil, keyEquivalent: ""))
+            menu.addItem(sectionHeader("Fans"))
+            for f in fans {
+                let modeLabel: String = {
+                    switch f.mode {
+                    case 0: return "auto"
+                    case 1: return "forced"
+                    case .some(let m): return "mode \(m)"
+                    case .none: return "?"
+                    }
+                }()
+                let rangeStr: String = {
+                    if let mn = f.minRPM, let mx = f.maxRPM {
+                        return String(format: " [%.0f–%.0f]", mn, mx)
+                    }
+                    return ""
+                }()
+                let title = String(
+                    format: "  Fan %d: %.0f RPM%@ — %@",
+                    f.index, f.actualRPM, rangeStr, modeLabel
+                )
+                menu.addItem(disabled(title))
             }
         }
+
         menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+
+        // Sensors section
+        menu.addItem(sectionHeader("Temperatures"))
+        if readings.isEmpty {
+            menu.addItem(disabled("  No sensors found"))
+        } else {
+            for r in readings {
+                let title = String(format: "  %@  %.1f°C", r.name, r.celsius)
+                menu.addItem(disabled(title))
+            }
+        }
+
+        menu.addItem(NSMenuItem.separator())
+        menu.addItem(NSMenuItem(title: "Quit ChillPill", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         statusItem.menu = menu
+    }
+
+    private func sectionHeader(_ title: String) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        item.isEnabled = false
+        item.attributedTitle = NSAttributedString(
+            string: title,
+            attributes: [
+                .font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize, weight: .semibold),
+                .foregroundColor: NSColor.secondaryLabelColor
+            ]
+        )
+        return item
+    }
+
+    private func disabled(_ title: String) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        item.isEnabled = false
+        return item
     }
 }
 
