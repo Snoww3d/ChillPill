@@ -11,6 +11,19 @@ private let helperPlistName = "dev.chillpill.helper.plist"
 /// doesn't surprise the user with a second "Background Items Added" prompt.
 private let uninstallFlagKey = "ChillPill.UserDidUninstallHelper"
 
+/// UserDefaults key: JSON-encoded `DisplaySensor` driving the menu-bar
+/// title temperature. Absent / unreadable falls back to `.auto`.
+private let displaySensorKey = "ChillPill.DisplaySensor"
+
+/// Which temperature drives the menu-bar title number. `.auto` keeps the
+/// legacy heuristic (hottest P-core, fall back through CPU-adjacent
+/// groups, then any temp). `.selector` defers to a `SensorSelector` —
+/// max or avg of a named group, mirroring the controller's picker.
+enum DisplaySensor: Codable, Equatable {
+    case auto
+    case selector(SensorSelector)
+}
+
 /// Describes exactly one action the menu can request. Each case carries the
 /// data its XPC call needs — no overloaded `Double?` whose meaning depends
 /// on a sibling enum, so the `applyFanAction` switch is exhaustive and
@@ -34,6 +47,12 @@ final class FanActionBox: NSObject {
 final class SensorSelectorBox: NSObject {
     let selector: SensorSelector
     init(_ selector: SensorSelector) { self.selector = selector }
+}
+
+/// Same reason as `FanActionBox` — `DisplaySensor` is a value type.
+final class DisplaySensorBox: NSObject {
+    let choice: DisplaySensor
+    init(_ choice: DisplaySensor) { self.choice = choice }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -77,6 +96,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var latestTemps: [TemperatureDTO] = []
     private var latestControlState: ControlStateDTO?
 
+    /// User's choice of which sensor drives the menu-bar title. Loaded
+    /// from UserDefaults at launch; mutated only via `applyDisplaySensor`.
+    private var displaySensor: DisplaySensor = .auto
+
     /// CPU-family sensor groups that nest under a single "CPU" parent in
     /// the menu. `.cpu` is the Intel-era / miscellaneous fallback; under
     /// the parent it's relabelled "Other" to avoid a "CPU → CPU" row.
@@ -92,6 +115,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         installSignalHandlers()
+        loadDisplaySensor()
         autoRegisterHelperIfNeeded()
         refresh()
 
@@ -507,6 +531,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(NSMenuItem.separator())
 
         menu.addItem(sectionHeader("Temperatures"))
+        menu.addItem(displaySensorSubmenu())
         if latestTemps.isEmpty {
             menu.addItem(disabled("  No sensors found"))
         } else {
@@ -546,11 +571,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 return
             }
         }
-        guard let hottest = hottestCPU(latestTemps) else {
+        guard let celsius = displayedCelsius(latestTemps) else {
             statusItem.button?.title = " --°"
             return
         }
-        statusItem.button?.title = String(format: " %.0f°", hottest.celsius)
+        statusItem.button?.title = String(format: " %.0f°", celsius)
+    }
+
+    /// Resolves `displaySensor` against the latest readings. Returns nil
+    /// when the chosen group has no readings — caller renders " --°".
+    private func displayedCelsius(_ temps: [TemperatureDTO]) -> Double? {
+        switch displaySensor {
+        case .auto:
+            return hottestCPU(temps)?.celsius
+        case .selector(let sel):
+            let group: SensorGroup
+            switch sel {
+            case .groupMax(let g), .groupAvg(let g): group = g
+            }
+            let pool = temps.filter { $0.group == group }
+            guard !pool.isEmpty else { return nil }
+            switch sel {
+            case .groupMax: return pool.max { $0.celsius < $1.celsius }?.celsius
+            case .groupAvg: return pool.map(\.celsius).reduce(0, +) / Double(pool.count)
+            }
+        }
     }
 
     private func hottestCPU(_ temps: [TemperatureDTO]) -> TemperatureDTO? {
@@ -790,25 +835,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let parent = NSMenuItem(title: "Sensor", action: nil, keyEquivalent: "")
         let submenu = NSMenu()
         submenu.delegate = self
-        var lastWasMax: Bool? = nil
-        for (i, choice) in Self.sensorChoices.enumerated() {
+        appendSensorChoiceRows(
+            to: submenu,
+            action: #selector(applySensor(_:)),
+            isSelected: { $0 == state.sensor },
+            makeBox: { SensorSelectorBox($0) }
+        )
+        parent.submenu = submenu
+        return parent
+    }
+
+    /// Builds one checkmarked row per `sensorChoices` entry, inserting a
+    /// single separator between the `max` and `avg` blocks. Shared by the
+    /// controller's "Sensor" picker and the menu-bar display picker — they
+    /// have identical layout but different action targets, selection state,
+    /// and representedObject types.
+    private func appendSensorChoiceRows(
+        to submenu: NSMenu,
+        action: Selector,
+        isSelected: (SensorSelector) -> Bool,
+        makeBox: (SensorSelector) -> NSObject
+    ) {
+        var lastWasMax: Bool?
+        for choice in Self.sensorChoices {
             let isMax: Bool = {
                 if case .groupMax = choice.selector { return true } else { return false }
             }()
-            if let prev = lastWasMax, prev != isMax, i > 0 {
+            if let prev = lastWasMax, prev != isMax {
                 submenu.addItem(NSMenuItem.separator())
             }
             lastWasMax = isMax
             let item = NSMenuItem(title: choice.label,
-                                  action: #selector(applySensor(_:)),
+                                  action: action,
                                   keyEquivalent: "")
             item.target = self
-            item.representedObject = SensorSelectorBox(choice.selector)
-            item.state = (choice.selector == state.sensor) ? .on : .off
+            item.representedObject = makeBox(choice.selector)
+            item.state = isSelected(choice.selector) ? .on : .off
             submenu.addItem(item)
         }
-        parent.submenu = submenu
-        return parent
     }
 
     private func presetSubmenu(state: ControlStateDTO) -> NSMenuItem {
@@ -1075,6 +1139,84 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + expiry + 0.05) { [weak self] in
             self?.refresh()
         }
+    }
+
+    // MARK: - Display sensor
+
+    private func loadDisplaySensor() {
+        guard let data = UserDefaults.standard.data(forKey: displaySensorKey) else {
+            return
+        }
+        do {
+            displaySensor = try JSONDecoder().decode(DisplaySensor.self, from: data)
+        } catch {
+            // Stale / corrupt blob — likely a downgrade from a future build
+            // that added an enum case, or a hand-edit. Drop the bad value
+            // so we don't re-fail every launch, and fall back to .auto.
+            os_log("display sensor decode failed (%{public}@) — resetting to auto",
+                   log: log, type: .info, error.localizedDescription)
+            UserDefaults.standard.removeObject(forKey: displaySensorKey)
+        }
+    }
+
+    private func saveDisplaySensor() {
+        guard let data = try? JSONEncoder().encode(displaySensor) else { return }
+        UserDefaults.standard.set(data, forKey: displaySensorKey)
+    }
+
+    /// Short label for the parent submenu row. When the user picked a
+    /// specific group that currently has no readings, annotate so it's
+    /// obvious why the menu bar shows "--°" instead of a number.
+    private func displaySensorLabel(_ d: DisplaySensor, temps: [TemperatureDTO]) -> String {
+        switch d {
+        case .auto:
+            return "Auto"
+        case .selector(let s):
+            let label = shortLabel(for: s)
+            let group: SensorGroup
+            switch s {
+            case .groupMax(let g), .groupAvg(let g): group = g
+            }
+            let hasReadings = temps.contains { $0.group == group }
+            return hasReadings ? label : "\(label) (no readings)"
+        }
+    }
+
+    private func displaySensorSubmenu() -> NSMenuItem {
+        let parent = NSMenuItem(
+            title: "Menu Bar Sensor: \(displaySensorLabel(displaySensor, temps: latestTemps))",
+            action: nil, keyEquivalent: "")
+        let submenu = NSMenu()
+        submenu.delegate = self
+
+        let auto = NSMenuItem(title: "Auto (hottest CPU)",
+                              action: #selector(applyDisplaySensor(_:)),
+                              keyEquivalent: "")
+        auto.target = self
+        auto.representedObject = DisplaySensorBox(.auto)
+        auto.state = (displaySensor == .auto) ? .on : .off
+        submenu.addItem(auto)
+        submenu.addItem(NSMenuItem.separator())
+
+        appendSensorChoiceRows(
+            to: submenu,
+            action: #selector(applyDisplaySensor(_:)),
+            isSelected: { self.displaySensor == .selector($0) },
+            makeBox: { DisplaySensorBox(.selector($0)) }
+        )
+        parent.submenu = submenu
+        return parent
+    }
+
+    @objc private func applyDisplaySensor(_ sender: NSMenuItem) {
+        guard let box = sender.representedObject as? DisplaySensorBox else { return }
+        displaySensor = box.choice
+        saveDisplaySensor()
+        // Update the title synchronously — `rebuildMenu()` would early-return
+        // here because the menu is still tracking when the action fires
+        // (`menuDidClose` runs after). The next 2-second timer rebuild
+        // refreshes the parent label and checkmark state in the dropdown.
+        updateStatusTitle()
     }
 
     // MARK: - Menu helpers
