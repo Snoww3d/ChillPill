@@ -12,6 +12,40 @@ enum Sensors {
     private static let eventTypeTemperature: Int64 = 15
     private static let fieldTemperatureLevel: Int32 = 15 << 16
 
+    // MARK: - Reading filters
+    //
+    // Two predicates with deliberately different lower bounds. Keeping them
+    // named (rather than as duplicated inline expressions) so a future
+    // "DRY this up" pass doesn't quietly reunify them and reintroduce the
+    // zero-skew bug this asymmetry exists to fix.
+
+    /// Per-cycle filter — admits a read into the DTO list as a real
+    /// measurement *right now*. Drops the canonical "sensor not populated"
+    /// sentinel of 0.0 used by HID and SMC for absent / unplugged probes
+    /// (e.g. battery on a desktop, charger when unplugged). Letting zeros
+    /// through skews every `groupAvg` consumer: the menu-bar display
+    /// picker, the Temperatures-section averages, and the controller's
+    /// avg sensor mode.
+    ///
+    /// Known accepted trade: a Mac genuinely operating below ~1°C ambient
+    /// will see its `Ts*` / `TaLP` / `TA*P` ambient/skin/palm probes also
+    /// dropped. Treating "below freezing" as out-of-scope for this app.
+    private static func isLiveReading(_ v: Double) -> Bool {
+        v.isFinite && v > 0 && v < 150
+    }
+
+    /// Cache-discovery filter — admits an SMC key into `smcCache` as a
+    /// plausible temperature sensor. Looser than `isLiveReading` on the
+    /// low end so a probe that happens to read exactly 0.0 at boot
+    /// (battery probe before charge cycle, charger before plug-in) still
+    /// gets cached and can become live on a later cycle. Cost: a handful
+    /// of permanently-zero probes on desktops cause O(K) wasted SMC reads
+    /// per refresh; SMC reads are microsecond-cheap so we don't bother
+    /// with soft eviction.
+    private static func isPlausibleTemperature(_ v: Double) -> Bool {
+        v.isFinite && v > -50 && v < 150
+    }
+
     /// Merged HID + SMC readings, de-duplicated by display name.
     static func readThermal() -> [TemperatureDTO] {
         var readings = readHIDTemperatures()
@@ -50,7 +84,7 @@ enum Sensors {
                 0
             )?.takeRetainedValue() else { continue }
             let value = IOHIDEventGetFloatValue(event, fieldTemperatureLevel)
-            if value.isFinite && value > -50 && value < 150 {
+            if isLiveReading(value) {
                 out.append(TemperatureDTO(
                     rawName: raw, displayName: display, celsius: value,
                     group: group(forRawName: raw)))
@@ -74,7 +108,7 @@ enum Sensors {
             guard let display = smcFriendlyName(k.key) else { continue }
             guard let value = SMC.shared.readWithInfo(k.key, info: k.info)
                 .flatMap({ SMC.decode($0) }) else { continue }
-            guard value.isFinite, value > -50, value < 150 else { continue }
+            guard isLiveReading(value) else { continue }
             out.append(TemperatureDTO(
                 rawName: k.key, displayName: display, celsius: value,
                 group: group(forRawName: k.key)))
@@ -90,7 +124,7 @@ enum Sensors {
             guard temperatureDataTypes.contains(k.info.dataType) else { return false }
             guard let v = SMC.shared.readWithInfo(k.key, info: k.info)
                 .flatMap({ SMC.decode($0) }) else { return false }
-            return v.isFinite && v > -50 && v < 150
+            return isPlausibleTemperature(v)
         }
         smcCache = filtered
         return filtered
