@@ -856,7 +856,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         isSelected: (SensorSelector) -> Bool,
         makeBox: (SensorSelector) -> NSObject
     ) {
-        var lastWasMax: Bool? = nil
+        var lastWasMax: Bool?
         for choice in Self.sensorChoices {
             let isMax: Bool = {
                 if case .groupMax = choice.selector { return true } else { return false }
@@ -1201,7 +1201,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         appendSensorChoiceRows(
             to: submenu,
             action: #selector(applyDisplaySensor(_:)),
-            isSelected: { [displaySensor] sel in displaySensor == .selector(sel) },
+            isSelected: { self.displaySensor == .selector($0) },
             makeBox: { DisplaySensorBox(.selector($0)) }
         )
         parent.submenu = submenu
