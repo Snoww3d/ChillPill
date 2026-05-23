@@ -56,6 +56,7 @@ enum Fans {
         if let mn = reading.minRPM, let mx = reading.maxRPM, mx > mn {
             clamped = min(max(rpm, mn), mx)
         } else {
+            dumpFanKeysOnce(trigger: "setTarget F\(index)")
             return false
         }
 
@@ -92,6 +93,7 @@ enum Fans {
         for i in 0..<n {
             let reading = read(i)
             guard let mn = reading.minRPM, let mx = reading.maxRPM, mx > mn else {
+                dumpFanKeysOnce(trigger: "setAllTargets F\(i)")
                 allOK = false
                 continue
             }
@@ -103,5 +105,56 @@ enum Fans {
 
     private static func isValidIndex(_ index: Int) -> Bool {
         index >= 0 && index < count()
+    }
+
+    // MARK: - Diagnostics
+
+    private static var didDumpFanKeys = false
+
+    /// One-shot diagnostic that enumerates every SMC key starting with "F"
+    /// and logs its type + size, plus raw bytes for each fan's Mn/Mx. Fires
+    /// the first time `setTarget` or `setAllTargets` rejects a write because
+    /// the fan's [Min, Max] range can't be read — gives a Mac model that
+    /// doesn't expose `F{n}Mn` / `F{n}Mx` (e.g. issue #19, M5 Pro / Mac17,8)
+    /// an actionable log dump instead of just "range unknown".
+    private static func dumpFanKeysOnce(trigger: String) {
+        guard !didDumpFanKeys else { return }
+        didDumpFanKeys = true
+
+        os_log(
+            "Fans: range unknown on %{public}@ — dumping SMC fan keys for diagnosis",
+            log: Self.log, type: .info, trigger
+        )
+
+        let all = SMC.shared.discoverAllKeys()
+        let fanKeys = all.filter { $0.key.hasPrefix("F") }
+            .sorted { $0.key < $1.key }
+        os_log("Fans: discovered %d F* keys:", log: Self.log, type: .info, fanKeys.count)
+        for k in fanKeys {
+            os_log(
+                "Fans:   %{public}@  size=%u  type=%{public}@",
+                log: Self.log, type: .info,
+                k.key, k.info.dataSize, k.info.dataType
+            )
+        }
+
+        let n = count()
+        os_log("Fans: FNum=%d — probing per-fan Mn/Mx raw bytes:", log: Self.log, type: .info, n)
+        for i in 0..<n {
+            for suffix in ["Mn", "Mx", "Ac", "Tg", "Md", "Sf"] {
+                let key = "F\(i)\(suffix)"
+                if let v = SMC.shared.read(key) {
+                    let hex = v.bytes.map { String(format: "%02x", $0) }.joined(separator: " ")
+                    let decoded = SMC.shared.readDouble(key).map { String(format: "%.2f", $0) } ?? "nil"
+                    os_log(
+                        "Fans:   %{public}@  type=%{public}@  bytes=[%{public}@]  decoded=%{public}@",
+                        log: Self.log, type: .info,
+                        key, v.info.dataType, hex, decoded
+                    )
+                } else {
+                    os_log("Fans:   %{public}@  ABSENT", log: Self.log, type: .info, key)
+                }
+            }
+        }
     }
 }
